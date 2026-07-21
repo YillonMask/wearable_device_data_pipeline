@@ -98,7 +98,7 @@ def hr_scan(
         found = asyncio.run(scan_hr_peripherals(timeout))
     except ImportError:
         typer.echo(
-            "bleak not installed. Install with: `uv sync --extra ble`"
+            "bleak not installed. Install with: `uv sync --extra ble`", err=True
         )
         raise typer.Exit(code=2)
 

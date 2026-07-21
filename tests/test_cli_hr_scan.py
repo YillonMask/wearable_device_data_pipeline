@@ -14,8 +14,8 @@ def test_hr_scan_lists_devices(monkeypatch):
     monkeypatch.setattr(cli, "scan_hr_peripherals", fake_scan)
     result = runner.invoke(cli.app, ["hr-scan"])
     assert result.exit_code == 0
-    assert "AA:BB:CC:DD:EE:FF" in result.stdout
-    assert "Fitbit Air" in result.stdout
+    assert "AA:BB:CC:DD:EE:FF" in result.output
+    assert "Fitbit Air" in result.output
 
 
 def test_hr_scan_missing_bleak(monkeypatch):
@@ -25,4 +25,4 @@ def test_hr_scan_missing_bleak(monkeypatch):
     monkeypatch.setattr(cli, "scan_hr_peripherals", boom)
     result = runner.invoke(cli.app, ["hr-scan"])
     assert result.exit_code == 2
-    assert "uv sync --extra ble" in result.stdout
+    assert "uv sync --extra ble" in result.output
