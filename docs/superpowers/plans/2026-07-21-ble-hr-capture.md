@@ -994,8 +994,11 @@ git commit -m "feat(ble): add hr-capture CLI command with live readout"
 **Interfaces:**
 - Consumes: sample dicts from `load_hr_session` (Task 6) — each `{device, ts_utc, t_offset_ms, bpm}`.
 - Produces:
-  - `align_series(samples: list[dict], *, step_s: int = 1, tolerance_s: int = 2) -> "pandas.DataFrame"` — index = whole-second offset, columns = device names, values = nearest bpm within tolerance else NaN.
-  - `compute_stats(aligned) -> dict` — keys: `mean_abs_diff`, `median_abs_diff`, `max_abs_diff`, `pearson_r`, `spearman_rho`, `pct_within_5`, and `per_device` (`{device: {avg, max, min}}`), `n_overlap`.
+  - `align_series(samples: list[dict], *, step_s: int = 1, max_hold_s: int = 8) -> "pandas.DataFrame"` — index = whole-second offset, columns = device names. Each device's last observed BPM is **held forward** (step interpolation) across the grid for up to `max_hold_s` seconds, then NaN until the next sample; seconds before a device's first sample are NaN. This lets a ~1 Hz series (Whoop) and a sub-1 Hz, contact-gated series (Fitbit Air) sit on one axis without dropping the slow device's points as gaps.
+  - `series_rates(samples: list[dict]) -> dict` — per-device sampling stats: `{device: {n, effective_hz, median_gap_s}}`. Reports how densely each device actually streamed this session (Fitbit is expected to be much sparser than Whoop).
+  - `compute_stats(aligned, rates: dict | None = None) -> dict` — keys: `mean_abs_diff`, `median_abs_diff`, `max_abs_diff`, `pearson_r`, `spearman_rho`, `pct_within_5`, `n_overlap`, and `per_device` (`{device: {avg, max, min, effective_hz, median_gap_s, n_samples}}`). Agreement stats computed over seconds where both devices have a (held) value.
+
+**Design note (from the feasibility spike):** Fitbit Air is intentionally throttled/contact-gated — at rest it streamed ~1 sample every 2.5 s (vs Whoop's ~1 Hz), and on the wrist during motion it can be sparser still. So we treat Fitbit as the low-resolution series: step-hold it onto Whoop's 1 Hz grid rather than expecting matched samples, use a generous `max_hold_s=8`, and always report each device's effective rate so a comparison is read in the context of how much Fitbit data actually arrived.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1005,43 +1008,61 @@ from __future__ import annotations
 
 import math
 
-from wearable_pipeline.capture.compare import align_series, compute_stats
+from wearable_pipeline.capture.compare import (
+    align_series,
+    compute_stats,
+    series_rates,
+)
 
 
-def _samples():
+def _samples(fitbit_every: int = 3):
+    """Whoop at 1 Hz for 10 s; Fitbit (google_health) every `fitbit_every` s."""
     out = []
     for sec in range(10):
         out.append({"device": "whoop", "ts_utc": "x", "t_offset_ms": sec * 1000, "bpm": 120 + sec})
+    for sec in range(0, 10, fitbit_every):
         out.append({"device": "google_health", "ts_utc": "x", "t_offset_ms": sec * 1000, "bpm": 118 + sec})
     return out
 
 
-def test_align_produces_two_columns():
-    aligned = align_series(_samples())
-    assert list(aligned.columns) == ["whoop", "google_health"] or set(aligned.columns) == {"whoop", "google_health"}
+def test_align_step_fills_sparse_series():
+    aligned = align_series(_samples())  # fitbit every 3 s
+    assert set(aligned.columns) == {"whoop", "google_health"}
     assert len(aligned) == 10
+    # Fitbit is sparse but step-held -> no gaps across the 10 s, and held values repeat
+    assert aligned["google_health"].notna().all()
+    assert aligned["google_health"].iloc[1] == aligned["google_health"].iloc[0]  # held
 
 
-def test_stats_basic():
-    stats = compute_stats(align_series(_samples()))
+def test_series_rates_report_density():
+    rates = series_rates(_samples())
+    assert rates["whoop"]["n"] == 10
+    assert rates["whoop"]["effective_hz"] == 1.0
+    assert rates["whoop"]["median_gap_s"] == 1.0
+    assert rates["google_health"]["n"] == 4
+    assert rates["google_health"]["median_gap_s"] == 3.0
+
+
+def test_stats_over_step_filled_grid():
+    samples = _samples()  # fitbit every 3 s
+    stats = compute_stats(align_series(samples), series_rates(samples))
     assert stats["n_overlap"] == 10
-    assert math.isclose(stats["mean_abs_diff"], 2.0, abs_tol=1e-9)
-    assert stats["max_abs_diff"] == 2.0
+    # whoop 120..129 vs fitbit held 118/121/124/127 -> |diff| cycles 2,3,4
+    assert math.isclose(stats["mean_abs_diff"], 2.9, abs_tol=1e-9)
+    assert stats["max_abs_diff"] == 4.0
     assert stats["pct_within_5"] == 100.0
-    assert stats["per_device"]["whoop"]["max"] == 129
-    assert stats["per_device"]["google_health"]["min"] == 118
-    assert -1.0 <= stats["spearman_rho"] <= 1.0
+    # rate fields threaded into per_device
+    assert stats["per_device"]["google_health"]["effective_hz"] == round(3 / 9.0, 2)
+    assert stats["per_device"]["whoop"]["n_samples"] == 10
 
 
-def test_gap_when_out_of_tolerance():
-    samples = [
-        {"device": "whoop", "ts_utc": "x", "t_offset_ms": 0, "bpm": 100},
-        {"device": "google_health", "ts_utc": "x", "t_offset_ms": 9000, "bpm": 100},
-    ]
-    aligned = align_series(samples, tolerance_s=2)
-    # second 0 has whoop but not google_health, second 9 vice-versa -> no overlap
+def test_max_hold_expires_into_gap():
+    # Fitbit sample only at t=0; with a 3 s hold it should NaN out after sec 3.
+    samples = [{"device": "whoop", "ts_utc": "x", "t_offset_ms": s * 1000, "bpm": 120 + s} for s in range(10)]
+    samples.append({"device": "google_health", "ts_utc": "x", "t_offset_ms": 0, "bpm": 118})
+    aligned = align_series(samples, max_hold_s=3)
     stats = compute_stats(aligned)
-    assert stats["n_overlap"] == 0
+    assert stats["n_overlap"] == 4  # seconds 0,1,2,3 held; 4..9 are gaps
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1056,16 +1077,39 @@ Create `src/wearable_pipeline/capture/compare.py`:
 ```python
 from __future__ import annotations
 
+import statistics
 from typing import Any
 
 
-def align_series(
-    samples: list[dict], *, step_s: int = 1, tolerance_s: int = 2
-) -> Any:
-    """Resample each device's samples onto a shared whole-second grid.
+def series_rates(samples: list[dict]) -> dict:
+    """Per-device sampling density: {device: {n, effective_hz, median_gap_s}}."""
+    rates: dict[str, dict] = {}
+    devices: list[str] = []
+    for s in samples:
+        if s["device"] not in devices:
+            devices.append(s["device"])
+    for device in devices:
+        offs = sorted(s["t_offset_ms"] for s in samples if s["device"] == device)
+        entry: dict = {"n": len(offs), "effective_hz": None, "median_gap_s": None}
+        if len(offs) >= 2:
+            span_s = (offs[-1] - offs[0]) / 1000.0
+            gaps = [(b - a) / 1000.0 for a, b in zip(offs, offs[1:])]
+            entry["effective_hz"] = round((len(offs) - 1) / span_s, 2) if span_s > 0 else None
+            entry["median_gap_s"] = round(statistics.median(gaps), 2)
+        rates[device] = entry
+    return rates
 
-    For each second, take the device's nearest sample within tolerance_s;
-    otherwise NaN. Columns are device names, index is the second offset.
+
+def align_series(
+    samples: list[dict], *, step_s: int = 1, max_hold_s: int = 8
+) -> Any:
+    """Resample each device onto a shared 1 s grid by step interpolation.
+
+    Each device's last observed BPM is held forward across the grid for up to
+    max_hold_s seconds (so a sparse, contact-gated series like Fitbit Air draws
+    as a step function), after which the cell is NaN until the next sample.
+    Seconds before a device's first sample are NaN. Columns are device names,
+    index is the whole-second offset.
     """
     import pandas as pd
 
@@ -1080,36 +1124,45 @@ def align_series(
             devices.append(s["device"])
 
     data: dict[str, list[float]] = {}
-    tol_ms = tolerance_s * 1000
     for device in devices:
         pts = sorted(
-            ((s["t_offset_ms"], s["bpm"]) for s in samples if s["device"] == device)
+            (s["t_offset_ms"] / 1000.0, float(s["bpm"]))
+            for s in samples
+            if s["device"] == device
         )
         col: list[float] = []
+        idx = 0
+        last_t: float | None = None
+        last_val = float("nan")
         for sec in grid:
-            target = sec * 1000
-            best = min(pts, key=lambda p: abs(p[0] - target), default=None)
-            if best is not None and abs(best[0] - target) <= tol_ms:
-                col.append(float(best[1]))
+            while idx < len(pts) and pts[idx][0] <= sec:
+                last_t, last_val = pts[idx]
+                idx += 1
+            if last_t is not None and (sec - last_t) <= max_hold_s:
+                col.append(last_val)
             else:
                 col.append(float("nan"))
         data[device] = col
     return pd.DataFrame(data, index=grid)
 
 
-def compute_stats(aligned: Any) -> dict:
-    import pandas as pd
+def compute_stats(aligned: Any, rates: dict | None = None) -> dict:
     from scipy.stats import pearsonr, spearmanr
 
     devices = list(aligned.columns)
     per_device = {}
     for d in devices:
         col = aligned[d].dropna()
-        per_device[d] = {
+        entry: dict = {
             "avg": round(float(col.mean()), 1) if len(col) else None,
             "max": int(col.max()) if len(col) else None,
             "min": int(col.min()) if len(col) else None,
         }
+        if rates and d in rates:
+            entry["effective_hz"] = rates[d]["effective_hz"]
+            entry["median_gap_s"] = rates[d]["median_gap_s"]
+            entry["n_samples"] = rates[d]["n"]
+        per_device[d] = entry
 
     stats: dict = {"per_device": per_device, "n_overlap": 0}
     if len(devices) == 2:
@@ -1130,7 +1183,7 @@ def compute_stats(aligned: Any) -> dict:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run --extra analysis pytest tests/test_hr_compare.py -v`
-Expected: PASS (3 passed).
+Expected: PASS (4 passed).
 
 - [ ] **Step 5: Commit**
 
@@ -1150,10 +1203,10 @@ git commit -m "feat(ble): add HR series alignment + agreement stats"
 - Test: `tests/test_cli_hr_compare.py`
 
 **Interfaces:**
-- Consumes: `load_hr_session` (Task 6), `align_series`, `compute_stats` (Task 9).
+- Consumes: `load_hr_session` (Task 6), `align_series`, `series_rates`, `compute_stats` (Task 9).
 - Produces:
-  - `render_chart(session_id: str, aligned, stats: dict, out_path: "pathlib.Path") -> None` — writes an overlay PNG.
-  - `wearable hr-compare <session_id> [--out PATH]` — prints stats, writes the chart PNG (default `data/hr_sessions/<id>.png`).
+  - `render_chart(session_id: str, aligned, stats: dict, out_path: "pathlib.Path") -> None` — writes an overlay PNG; each series' legend label includes its effective Hz (e.g. `Fitbit Air (~0.3 Hz)`).
+  - `wearable hr-compare <session_id> [--out PATH]` — prints agreement stats + per-device rate, writes the chart PNG (default `data/hr_sessions/<id>.png`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1178,6 +1231,8 @@ def _seed(conn):
     rows = []
     for sec in range(10):
         rows.append(("S1", "whoop", "x", sec * 1000, 120 + sec))
+    # Fitbit sparse (every 3 s) to exercise the step-fill + rate reporting path
+    for sec in range(0, 10, 3):
         rows.append(("S1", "google_health", "x", sec * 1000, 118 + sec))
     insert_hr_samples(conn, rows)
 
@@ -1196,8 +1251,9 @@ def test_hr_compare_prints_stats_and_writes_png(monkeypatch, tmp_path):
 
     out = tmp_path / "chart.png"
     result = runner.invoke(cli.app, ["hr-compare", "S1", "--out", str(out)])
-    assert result.exit_code == 0, result.stdout
-    assert "mean_abs_diff" in result.stdout or "mean abs diff" in result.stdout.lower()
+    assert result.exit_code == 0, result.output
+    assert "mean_abs_diff" in result.output
+    assert "rate=" in result.output  # per-device effective Hz surfaced
     assert out.exists() and out.stat().st_size > 0
 ```
 
@@ -1216,12 +1272,16 @@ def render_chart(session_id: str, aligned: Any, stats: dict, out_path) -> None:
     import matplotlib.pyplot as plt
 
     label_map = {"whoop": "Whoop", "google_health": "Fitbit Air"}
+    per_device = stats.get("per_device", {})
     fig, ax = plt.subplots(figsize=(11, 5), dpi=120)
     for device in aligned.columns:
+        name = label_map.get(device, device)
+        hz = per_device.get(device, {}).get("effective_hz")
+        label = f"{name} (~{hz} Hz)" if hz is not None else name
         ax.plot(
             [i / 60.0 for i in aligned.index],
             aligned[device],
-            label=label_map.get(device, device),
+            label=label,
             lw=1.8,
         )
     ax.set_xlabel("elapsed (min)")
@@ -1249,7 +1309,12 @@ def hr_compare(
 ) -> None:
     """Overlay + agreement stats for a captured HR session (needs `analysis`)."""
     try:
-        from .capture.compare import align_series, compute_stats, render_chart
+        from .capture.compare import (
+            align_series,
+            compute_stats,
+            render_chart,
+            series_rates,
+        )
     except ImportError:
         typer.echo(
             "pandas/scipy/matplotlib missing. Install with: `uv sync --extra analysis`",
@@ -1271,12 +1336,17 @@ def hr_compare(
         raise typer.Exit(code=1)
 
     aligned = align_series(samples)
-    stats = compute_stats(aligned)
+    rates = series_rates(samples)
+    stats = compute_stats(aligned, rates)
     for k, v in stats.items():
         if k != "per_device":
             typer.echo(f"  {k}: {v}")
     for device, d in stats["per_device"].items():
-        typer.echo(f"  {device}: avg={d['avg']} max={d['max']} min={d['min']}")
+        typer.echo(
+            f"  {device}: avg={d['avg']} max={d['max']} min={d['min']} "
+            f"n={d.get('n_samples')} rate={d.get('effective_hz')}Hz "
+            f"gap={d.get('median_gap_s')}s"
+        )
 
     out_path = Path(out) if out else Path("data/hr_sessions") / f"{session_id}.png"
     render_chart(session_id, aligned, stats, out_path)
@@ -1334,7 +1404,7 @@ git commit -m "feat(ble): add hr-compare chart+stats command and docs"
 - Live side-by-side readout while logging → Task 8. ✓
 - Stop on Ctrl-C or `--minutes` → Task 8. ✓
 - Two tables `hr_sessions` + `hr_samples`, migration 0005, device vocab, ISO TEXT / INT ms → Task 6. ✓
-- Compare: 1 Hz alignment (nearest within 2 s, gaps not imputed), stats (mean/median/max abs diff, Pearson, Spearman, %±5, per-device avg/max/min), overlay PNG to `data/hr_sessions/` → Tasks 9–10. ✓
+- Compare: 1 Hz grid via step-interpolation (last value held forward up to `max_hold_s`, then gap) so the sparse contact-gated Fitbit series isn't dropped; per-device rate reporting (`series_rates`); stats (mean/median/max abs diff, Pearson, Spearman, %±5, per-device avg/max/min + effective Hz), overlay PNG to `data/hr_sessions/` with Hz in the legend → Tasks 9–10. ✓
 - Extras: `ble` = bleak; matplotlib into `analysis`; per-command dependency hints → Tasks 1, 4, 8, 10. ✓
 - BPM only, RR/HRV out of scope → Task 2 parser + no columns for it. ✓
 - Feasibility spike as gate before full build → Task 5. ✓
