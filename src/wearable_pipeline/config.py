@@ -26,6 +26,8 @@ class Settings:
     google_client_secret: str | None
     google_redirect_uri: str | None
     google_refresh_token: str | None
+    whoop_ble_address: str | None
+    fitbit_ble_address: str | None
 
 
 def _opt(name: str) -> str | None:
@@ -47,4 +49,6 @@ def load_settings() -> Settings:
         google_client_secret=_opt("GOOGLE_HEALTH_CLIENT_SECRET"),
         google_redirect_uri=_opt("GOOGLE_HEALTH_REDIRECT_URI"),
         google_refresh_token=_opt("GOOGLE_HEALTH_REFRESH_TOKEN"),
+        whoop_ble_address=_opt("WHOOP_BLE_ADDRESS"),
+        fitbit_ble_address=_opt("FITBIT_BLE_ADDRESS"),
     )
