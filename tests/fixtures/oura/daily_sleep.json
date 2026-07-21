@@ -1,0 +1,20 @@
+{
+  "data": [
+    {
+      "id": "abc-123",
+      "day": "2026-06-21",
+      "score": 82,
+      "timestamp": "2026-06-21T00:00:00+00:00",
+      "contributors": {
+        "deep_sleep": 85,
+        "efficiency": 95,
+        "latency": 75,
+        "rem_sleep": 80,
+        "restfulness": 70,
+        "timing": 90,
+        "total_sleep": 85
+      }
+    }
+  ],
+  "next_token": null
+}

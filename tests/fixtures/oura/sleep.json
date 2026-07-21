@@ -1,0 +1,40 @@
+{
+  "data": [
+    {
+      "id": "jkl-101",
+      "day": "2026-06-21",
+      "bedtime_start": "2026-06-20T23:15:00-07:00",
+      "bedtime_end": "2026-06-21T07:00:00-07:00",
+      "total_sleep_duration": 25200,
+      "deep_sleep_duration": 5400,
+      "rem_sleep_duration": 6000,
+      "light_sleep_duration": 13800,
+      "awake_time": 1080,
+      "efficiency": 93,
+      "latency": 480,
+      "average_hrv": 52,
+      "average_heart_rate": 48,
+      "lowest_heart_rate": 45,
+      "average_breath": 14.5,
+      "type": "long_sleep"
+    },
+    {
+      "id": "jkl-102",
+      "day": "2026-06-21",
+      "bedtime_start": "2026-06-21T14:30:00-07:00",
+      "bedtime_end": "2026-06-21T15:00:00-07:00",
+      "total_sleep_duration": 1500,
+      "deep_sleep_duration": 200,
+      "rem_sleep_duration": 100,
+      "light_sleep_duration": 1100,
+      "awake_time": 100,
+      "efficiency": 85,
+      "latency": 60,
+      "average_hrv": 50,
+      "lowest_heart_rate": 55,
+      "average_breath": 14.0,
+      "type": "nap"
+    }
+  ],
+  "next_token": null
+}

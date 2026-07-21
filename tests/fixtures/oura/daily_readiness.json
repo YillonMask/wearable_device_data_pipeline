@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "id": "def-456",
+      "day": "2026-06-21",
+      "score": 88,
+      "temperature_deviation": -0.12,
+      "temperature_trend_deviation": -0.05,
+      "timestamp": "2026-06-21T00:00:00+00:00",
+      "contributors": {
+        "activity_balance": 85,
+        "body_temperature": 90,
+        "hrv_balance": 88,
+        "previous_day_activity": 80,
+        "previous_night": 92,
+        "recovery_index": 89,
+        "resting_heart_rate": 86,
+        "sleep_balance": 87
+      }
+    }
+  ],
+  "next_token": null
+}

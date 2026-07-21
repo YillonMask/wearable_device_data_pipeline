@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+*.pyo
+
+.venv/
+venv/
+
+.env
+
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+*.egg-info/
+build/
+dist/
+
+# macOS / editor / tool cruft
+.DS_Store
+.playwright-mcp/
+.claude/
+
+# personal-data artifacts (kept out of the public repo)
+viz-screenshot.png
+xiaohongshu_post/
