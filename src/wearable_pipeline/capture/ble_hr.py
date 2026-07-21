@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger("wearable_pipeline.capture")
 
 HR_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 HR_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
@@ -52,3 +56,57 @@ async def scan_hr_peripherals(timeout: float = 8.0) -> list[tuple[str, str]]:
         timeout=timeout, service_uuids=[HR_SERVICE_UUID]
     )
     return [(d.name or "(unknown)", d.address) for d in devices]
+
+
+async def capture_session(
+    addresses: dict[str, str],
+    session_start: datetime,
+    on_sample: Callable[[Sample], None],
+    stop_event: asyncio.Event,
+    *,
+    client_factory: Callable[[str], Any] | None = None,
+    reconnect_attempts: int = 3,
+) -> dict[str, int]:
+    """Connect each device, forward samples via on_sample until stop_event set.
+
+    Returns a per-device count of samples received. A device that keeps failing
+    to connect is logged and skipped; the others continue (partial tolerance).
+    """
+    if client_factory is None:
+        from bleak import BleakClient
+
+        client_factory = BleakClient
+
+    counts: dict[str, int] = {d: 0 for d in addresses}
+
+    def counting_sink(device: str):
+        base = make_notification_handler(device, session_start, on_sample)
+
+        def wrapped(char: Any, data: bytearray) -> None:
+            counts[device] += 1
+            base(char, data)
+
+        return wrapped
+
+    async def run_device(device: str, address: str) -> None:
+        for attempt in range(1, reconnect_attempts + 1):
+            try:
+                async with client_factory(address) as client:
+                    await client.start_notify(
+                        HR_MEASUREMENT_UUID, counting_sink(device)
+                    )
+                    await stop_event.wait()
+                    await client.stop_notify(HR_MEASUREMENT_UUID)
+                return
+            except Exception as exc:  # noqa: BLE001 - log and retry/skip
+                logger.warning(
+                    "device %s connect/notify failed (attempt %d/%d): %s",
+                    device, attempt, reconnect_attempts, exc,
+                )
+                if stop_event.is_set():
+                    return
+                await asyncio.sleep(1.0)
+        logger.error("device %s gave up after %d attempts", device, reconnect_attempts)
+
+    await asyncio.gather(*(run_device(d, a) for d, a in addresses.items()))
+    return counts
