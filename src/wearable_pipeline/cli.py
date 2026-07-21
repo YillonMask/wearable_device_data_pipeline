@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date, timedelta
 
 import typer
@@ -18,6 +19,7 @@ from .orchestrator import (
     pull_workouts,
     summarize,
 )
+from .capture.ble_hr import scan_hr_peripherals
 from .storage import upsert_manual_readiness, upsert_self_report
 
 app = typer.Typer(help="Multi-wearable health data pipeline.")
@@ -85,6 +87,32 @@ def auth(device: str) -> None:
         raise typer.Exit(code=0)
     typer.echo(f"auth flow for '{device}' not implemented yet.", err=True)
     raise typer.Exit(code=1)
+
+
+@app.command("hr-scan")
+def hr_scan(
+    timeout: float = typer.Option(8.0, "--timeout", help="Scan seconds."),
+) -> None:
+    """Scan for nearby BLE heart-rate peripherals; paste addresses into .env."""
+    try:
+        found = asyncio.run(scan_hr_peripherals(timeout))
+    except ImportError:
+        typer.echo(
+            "bleak not installed. Install with: `uv sync --extra ble`"
+        )
+        raise typer.Exit(code=2)
+
+    if not found:
+        typer.echo("No HR peripherals found. Enable HR broadcast on each device.")
+        raise typer.Exit(code=0)
+
+    typer.echo(f"{'NAME':<24s} ADDRESS")
+    for name, address in found:
+        typer.echo(f"{name:<24s} {address}")
+    typer.echo(
+        "\nSet WHOOP_BLE_ADDRESS / FITBIT_BLE_ADDRESS in .env to the matching "
+        "addresses above."
+    )
 
 
 @app.command()
