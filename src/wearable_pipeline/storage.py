@@ -108,3 +108,67 @@ def upsert_manual_readiness(
         ),
     )
     conn.commit()
+
+
+def create_hr_session(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    label: str | None,
+    started_at: str,
+    devices: list[str],
+) -> None:
+    conn.execute(
+        "INSERT INTO hr_sessions (id, label, started_at, ended_at, devices) "
+        "VALUES (?, ?, ?, NULL, ?)",
+        (session_id, label, started_at, json.dumps(devices)),
+    )
+    conn.commit()
+
+
+def insert_hr_samples(
+    conn: sqlite3.Connection,
+    samples: list[tuple[str, str, str, int, int]],
+) -> None:
+    """Each tuple: (session_id, device, ts_utc, t_offset_ms, bpm)."""
+    if not samples:
+        return
+    conn.executemany(
+        "INSERT OR IGNORE INTO hr_samples "
+        "(session_id, device, ts_utc, t_offset_ms, bpm) VALUES (?, ?, ?, ?, ?)",
+        samples,
+    )
+    conn.commit()
+
+
+def end_hr_session(
+    conn: sqlite3.Connection, *, session_id: str, ended_at: str
+) -> None:
+    conn.execute(
+        "UPDATE hr_sessions SET ended_at = ? WHERE id = ?",
+        (ended_at, session_id),
+    )
+    conn.commit()
+
+
+def load_hr_session(
+    conn: sqlite3.Connection, session_id: str
+) -> tuple[dict, list[dict]]:
+    row = conn.execute(
+        "SELECT id, label, started_at, ended_at, devices FROM hr_sessions "
+        "WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"no hr_session with id {session_id!r}")
+    session = dict(row)
+    session["devices"] = json.loads(session["devices"]) if session["devices"] else []
+    samples = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT device, ts_utc, t_offset_ms, bpm FROM hr_samples "
+            "WHERE session_id = ? ORDER BY t_offset_ms",
+            (session_id,),
+        )
+    ]
+    return session, samples
