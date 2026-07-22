@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import typer
 
@@ -19,8 +19,14 @@ from .orchestrator import (
     pull_workouts,
     summarize,
 )
-from .capture.ble_hr import scan_hr_peripherals
-from .storage import upsert_manual_readiness, upsert_self_report
+from .capture.ble_hr import capture_session, scan_hr_peripherals
+from .storage import (
+    create_hr_session,
+    end_hr_session,
+    insert_hr_samples,
+    upsert_manual_readiness,
+    upsert_self_report,
+)
 
 app = typer.Typer(help="Multi-wearable health data pipeline.")
 
@@ -112,6 +118,87 @@ def hr_scan(
     typer.echo(
         "\nSet WHOOP_BLE_ADDRESS / FITBIT_BLE_ADDRESS in .env to the matching "
         "addresses above."
+    )
+
+
+@app.command("hr-capture")
+def hr_capture(
+    label: str | None = typer.Option(None, "--label", help="Session label, e.g. 'bike'."),
+    minutes: float | None = typer.Option(
+        None, "--minutes", help="Auto-stop after N minutes (else Ctrl-C)."
+    ),
+) -> None:
+    """Capture live HR from Whoop + Fitbit Air over BLE into the DB."""
+    settings = load_settings()
+    if not settings.whoop_ble_address or not settings.fitbit_ble_address:
+        typer.echo(
+            "WHOOP_BLE_ADDRESS / FITBIT_BLE_ADDRESS missing from .env. "
+            "Run `wearable hr-scan` to discover them.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    configure_logging()
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+
+    start = datetime.now(timezone.utc)
+    session_id = start.strftime("%Y%m%dT%H%M%SZ")
+    devices = ["whoop", "google_health"]
+    create_hr_session(
+        conn,
+        session_id=session_id,
+        label=label,
+        started_at=start.isoformat(),
+        devices=devices,
+    )
+
+    addresses = {
+        "whoop": settings.whoop_ble_address,
+        "google_health": settings.fitbit_ble_address,
+    }
+    latest: dict[str, int] = {}
+    buffer: list[tuple[str, str, str, int, int]] = []
+
+    def on_sample(sample) -> None:
+        device, ts_utc, offset_ms, bpm = sample
+        latest[device] = bpm
+        buffer.append((session_id, device, ts_utc, offset_ms, bpm))
+        if len(buffer) >= 5:
+            insert_hr_samples(conn, buffer)
+            buffer.clear()
+        w = latest.get("whoop", 0)
+        f = latest.get("google_health", 0)
+        typer.echo(f"\rWHOOP {w:>3} | Fitbit Air {f:>3} | Δ{abs(w - f):>3}", nl=False)
+
+    async def _run() -> dict[str, int]:
+        stop_event = asyncio.Event()
+        if minutes is not None:
+            async def timer() -> None:
+                await asyncio.sleep(minutes * 60)
+                stop_event.set()
+            asyncio.create_task(timer())
+        cap = asyncio.create_task(
+            capture_session(addresses, start, on_sample, stop_event)
+        )
+        try:
+            return await cap
+        except asyncio.CancelledError:  # pragma: no cover
+            stop_event.set()
+            return await cap
+
+    try:
+        counts = asyncio.run(_run())
+    except KeyboardInterrupt:  # pragma: no cover - interactive stop
+        counts = {}
+
+    if buffer:
+        insert_hr_samples(conn, buffer)
+    end_hr_session(
+        conn, session_id=session_id, ended_at=datetime.now(timezone.utc).isoformat()
+    )
+    typer.echo(
+        f"\nsession {session_id} ({label or 'unlabeled'}) done. samples: {counts}"
     )
 
 
