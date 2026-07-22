@@ -98,6 +98,13 @@ def compute_stats(aligned: Any, rates: dict | None = None) -> dict:
             stats["median_abs_diff"] = round(float(diff.median()), 2)
             stats["max_abs_diff"] = round(float(diff.max()), 2)
             stats["pct_within_5"] = round(float((diff <= 5).mean() * 100), 1)
-            stats["pearson_r"] = round(float(pearsonr(a, b)[0]), 3)
-            stats["spearman_rho"] = round(float(spearmanr(a, b)[0]), 3)
+            # Correlation is undefined if either series is constant over the
+            # overlap (e.g. a flat step-held Fitbit segment) -> report None
+            # rather than emit scipy's ConstantInputWarning and a NaN.
+            if a.nunique() > 1 and b.nunique() > 1:
+                stats["pearson_r"] = round(float(pearsonr(a, b)[0]), 3)
+                stats["spearman_rho"] = round(float(spearmanr(a, b)[0]), 3)
+            else:
+                stats["pearson_r"] = None
+                stats["spearman_rho"] = None
     return stats

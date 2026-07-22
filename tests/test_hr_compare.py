@@ -57,3 +57,5 @@ def test_max_hold_expires_into_gap():
     aligned = align_series(samples, max_hold_s=3)
     stats = compute_stats(aligned)
     assert stats["n_overlap"] == 4  # seconds 0,1,2,3 held; 4..9 are gaps
+    assert stats["pearson_r"] is None   # constant Fitbit segment -> undefined
+    assert stats["spearman_rho"] is None
