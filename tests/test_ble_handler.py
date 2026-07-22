@@ -10,7 +10,7 @@ def test_handler_emits_sample_with_offset():
     got = []
     handler = make_notification_handler("whoop", start, got.append)
 
-    # Call twice with uint8 payloads; monkeypatch the clock via injected now()
+    # offset is derived from datetime.now(); start is in the past so it's positive
     handler(None, bytearray([0x00, 130]))
     handler(None, bytearray([0x00, 131]))
 

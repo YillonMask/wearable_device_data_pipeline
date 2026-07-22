@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-logger = logging.getLogger("wearable_pipeline.capture")
+logger = logging.getLogger(__name__)
 
 HR_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 HR_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
@@ -98,7 +98,7 @@ async def capture_session(
                     await stop_event.wait()
                     await client.stop_notify(HR_MEASUREMENT_UUID)
                 return
-            except Exception as exc:  # noqa: BLE001 - log and retry/skip
+            except Exception as exc:
                 logger.warning(
                     "device %s connect/notify failed (attempt %d/%d): %s",
                     device, attempt, reconnect_attempts, exc,

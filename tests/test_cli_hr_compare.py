@@ -28,9 +28,7 @@ def _seed(conn):
 
 def test_hr_compare_prints_stats_and_writes_png(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "t.db"))
-    import importlib
     from wearable_pipeline import config
-    importlib.reload(config)
     monkeypatch.setattr(cli, "load_settings", config.load_settings)
 
     conn = db.connect(tmp_path / "t.db")

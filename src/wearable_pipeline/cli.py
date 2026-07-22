@@ -8,6 +8,7 @@ import typer
 from . import db
 from .auth.google_flow import run_interactive_flow as run_google_flow
 from .auth.whoop_flow import run_interactive_flow as run_whoop_flow
+from .capture.ble_hr import capture_session, scan_hr_peripherals
 from .clients._oauth import update_env_var
 from .config import load_settings
 from .logging_setup import configure_logging
@@ -19,7 +20,6 @@ from .orchestrator import (
     pull_workouts,
     summarize,
 )
-from .capture.ble_hr import capture_session, scan_hr_peripherals
 from .storage import (
     create_hr_session,
     end_hr_session,
@@ -219,7 +219,7 @@ def hr_compare(
     conn = db.connect(settings.database_path)
     db.migrate(conn)
     try:
-        session, samples = load_hr_session(conn, session_id)
+        _, samples = load_hr_session(conn, session_id)
     except KeyError:
         typer.echo(f"No session {session_id!r}.", err=True)
         raise typer.Exit(code=1)
