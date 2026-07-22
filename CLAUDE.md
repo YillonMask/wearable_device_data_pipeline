@@ -225,6 +225,40 @@ The spec breaks the build into 6 phases. Phase 1 (scaffold) is done. The expecta
 - **Durations are in seconds** — convert to minutes for the normalized model (`_sec_to_min`).
 - **Main sleep is the longest session.** Oura returns naps and partial sessions in `/sleep`; there's no native main-vs-nap flag. Pick `max(data, key=total_sleep_duration)` (`_longest_sleep`).
 
+## BLE heart-rate capture
+
+`capture/` (`ble_hr.py`, `compare.py`) is a separate, **BLE-only** subpackage —
+it does not implement the `WearableClient` HTTP protocol used by `clients/`,
+since it talks to devices directly over Bluetooth rather than a vendor API.
+
+- Commands: `wearable hr-scan` (discover nearby BLE HR peripherals), `wearable
+  hr-capture` (live dual-device capture into `hr_sessions`/`hr_samples`), and
+  `wearable hr-compare <session_id>` (overlay chart + agreement stats; needs
+  the `analysis` extra).
+- Device BLE addresses live in `.env` as `WHOOP_BLE_ADDRESS` /
+  `FITBIT_BLE_ADDRESS`, discovered via `hr-scan` — there's no vendor API for
+  BLE peripheral discovery, so this is a manual one-time pairing step per
+  device. `google_health` is the device key for Fitbit Air here too, same as
+  the HTTP client.
+- **BPM only** — RR intervals / HRV are out of scope; the HR Measurement
+  characteristic parser only extracts heart rate.
+- **Fitbit only streams while its "Share Heart Rate" toggle is actively live**
+  in the Fitbit/Google Health phone app, and it's a low-rate, contact-gated
+  source — roughly 1 sample/2.5 s at rest, sometimes sparser on the wrist
+  during motion — versus Whoop's steady ~1 Hz. `capture/compare.py` handles
+  this by step-interpolating the sparser series onto a shared 1 s grid
+  (holding the last value forward up to `max_hold_s`) and reports each
+  device's effective Hz (`series_rates`) alongside the agreement stats, so a
+  slow Fitbit rate is visible rather than silently smoothed away.
+- Chart PNGs from `hr-compare` write to `data/hr_sessions/<session_id>.png` by
+  default — under the gitignored `data/` directory, same as the SQLite DB and
+  logs.
+- Requires a one-time macOS Bluetooth permission grant to the terminal app
+  (System Settings → Privacy & Security → Bluetooth) before `hr-scan` /
+  `hr-capture` can see peripherals.
+- Oura is out of scope for BLE capture — the ring does not broadcast live HR
+  over BLE.
+
 ## Working norms
 
 - Before writing or modifying a device client, fetch that device's current official API docs (endpoint shapes, scopes, auth steps). Training-data memory of these APIs is stale.

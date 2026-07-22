@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+import asyncio
+from datetime import date, datetime, timedelta, timezone
 
 import typer
 
 from . import db
 from .auth.google_flow import run_interactive_flow as run_google_flow
 from .auth.whoop_flow import run_interactive_flow as run_whoop_flow
+from .capture.ble_hr import capture_session, scan_hr_peripherals
 from .clients._oauth import update_env_var
 from .config import load_settings
 from .logging_setup import configure_logging
@@ -18,7 +20,13 @@ from .orchestrator import (
     pull_workouts,
     summarize,
 )
-from .storage import upsert_manual_readiness, upsert_self_report
+from .storage import (
+    create_hr_session,
+    end_hr_session,
+    insert_hr_samples,
+    upsert_manual_readiness,
+    upsert_self_report,
+)
 
 app = typer.Typer(help="Multi-wearable health data pipeline.")
 
@@ -85,6 +93,180 @@ def auth(device: str) -> None:
         raise typer.Exit(code=0)
     typer.echo(f"auth flow for '{device}' not implemented yet.", err=True)
     raise typer.Exit(code=1)
+
+
+@app.command("hr-scan")
+def hr_scan(
+    timeout: float = typer.Option(8.0, "--timeout", help="Scan seconds."),
+) -> None:
+    """Scan for nearby BLE heart-rate peripherals; paste addresses into .env."""
+    try:
+        found = asyncio.run(scan_hr_peripherals(timeout))
+    except ImportError:
+        typer.echo(
+            "bleak not installed. Install with: `uv sync --extra ble`", err=True
+        )
+        raise typer.Exit(code=2)
+
+    if not found:
+        typer.echo("No HR peripherals found. Enable HR broadcast on each device.")
+        raise typer.Exit(code=0)
+
+    typer.echo(f"{'NAME':<24s} ADDRESS")
+    for name, address in found:
+        typer.echo(f"{name:<24s} {address}")
+    typer.echo(
+        "\nSet WHOOP_BLE_ADDRESS / FITBIT_BLE_ADDRESS in .env to the matching "
+        "addresses above."
+    )
+
+
+@app.command("hr-capture")
+def hr_capture(
+    label: str | None = typer.Option(None, "--label", help="Session label, e.g. 'bike'."),
+    minutes: float | None = typer.Option(
+        None, "--minutes", help="Auto-stop after N minutes (else Ctrl-C)."
+    ),
+) -> None:
+    """Capture live HR from Whoop + Fitbit Air over BLE into the DB."""
+    settings = load_settings()
+    if not settings.whoop_ble_address or not settings.fitbit_ble_address:
+        typer.echo(
+            "WHOOP_BLE_ADDRESS / FITBIT_BLE_ADDRESS missing from .env. "
+            "Run `wearable hr-scan` to discover them.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    configure_logging()
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+
+    start = datetime.now(timezone.utc)
+    session_id = start.strftime("%Y%m%dT%H%M%SZ")
+    devices = ["whoop", "google_health"]
+    create_hr_session(
+        conn,
+        session_id=session_id,
+        label=label,
+        started_at=start.isoformat(),
+        devices=devices,
+    )
+
+    addresses = {
+        "whoop": settings.whoop_ble_address,
+        "google_health": settings.fitbit_ble_address,
+    }
+    latest: dict[str, int] = {}
+    buffer: list[tuple[str, str, str, int, int]] = []
+    sample_counts: dict[str, int] = {}
+
+    def on_sample(sample) -> None:
+        device, ts_utc, offset_ms, bpm = sample
+        latest[device] = bpm
+        buffer.append((session_id, device, ts_utc, offset_ms, bpm))
+        sample_counts[device] = sample_counts.get(device, 0) + 1
+        if len(buffer) >= 5:
+            insert_hr_samples(conn, buffer)
+            buffer.clear()
+        w = latest.get("whoop", 0)
+        f = latest.get("google_health", 0)
+        typer.echo(f"\rWHOOP {w:>3} | Fitbit Air {f:>3} | Δ{abs(w - f):>3}", nl=False)
+
+    async def _run() -> dict[str, int]:
+        stop_event = asyncio.Event()
+        if minutes is not None:
+            async def timer() -> None:
+                await asyncio.sleep(minutes * 60)
+                stop_event.set()
+            timer_task = asyncio.create_task(timer())
+        cap = asyncio.create_task(
+            capture_session(addresses, start, on_sample, stop_event)
+        )
+        try:
+            return await cap
+        except asyncio.CancelledError:  # pragma: no cover
+            stop_event.set()
+            return await cap
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:  # pragma: no cover - interactive stop
+        pass
+
+    if buffer:
+        insert_hr_samples(conn, buffer)
+    end_hr_session(
+        conn, session_id=session_id, ended_at=datetime.now(timezone.utc).isoformat()
+    )
+    typer.echo(
+        f"\nsession {session_id} ({label or 'unlabeled'}) done. "
+        f"samples: {sample_counts}"
+    )
+
+
+@app.command("hr-compare")
+def hr_compare(
+    session_id: str = typer.Argument(..., help="Session id (see hr_sessions.id)."),
+    out: str | None = typer.Option(None, "--out", help="Chart PNG path."),
+) -> None:
+    """Overlay + agreement stats for a captured HR session (needs `analysis`)."""
+    from pathlib import Path
+
+    from .storage import load_hr_session
+
+    settings = load_settings()
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+    try:
+        _, samples = load_hr_session(conn, session_id)
+    except KeyError:
+        typer.echo(f"No session {session_id!r}.", err=True)
+        raise typer.Exit(code=1)
+
+    # `align_series`/`compute_stats`/`render_chart` lazily import
+    # pandas/scipy/matplotlib inside their own bodies (Task 9's design), so
+    # the ImportError for a missing `analysis` extra only surfaces once one
+    # of them actually runs — not at the `from .capture.compare import ...`
+    # statement itself. Wrap the calls, not just the import, to catch it.
+    try:
+        from .capture.compare import (
+            align_series,
+            compute_stats,
+            render_chart,
+            series_rates,
+        )
+
+        aligned = align_series(samples)
+        rates = series_rates(samples)
+        stats = compute_stats(aligned, rates)
+    except ImportError:
+        typer.echo(
+            "pandas/scipy/matplotlib missing. Install with: `uv sync --extra analysis`",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    for k, v in stats.items():
+        if k != "per_device":
+            typer.echo(f"  {k}: {v}")
+    for device, d in stats["per_device"].items():
+        typer.echo(
+            f"  {device}: avg={d['avg']} max={d['max']} min={d['min']} "
+            f"n={d.get('n_samples')} rate={d.get('effective_hz')}Hz "
+            f"gap={d.get('median_gap_s')}s"
+        )
+
+    out_path = Path(out) if out else Path("data/hr_sessions") / f"{session_id}.png"
+    try:
+        render_chart(session_id, aligned, stats, out_path)
+    except ImportError:
+        typer.echo(
+            "pandas/scipy/matplotlib missing. Install with: `uv sync --extra analysis`",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    typer.echo(f"wrote {out_path}")
 
 
 @app.command()

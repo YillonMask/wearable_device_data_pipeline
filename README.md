@@ -76,6 +76,18 @@ uv run wearable viz                             # launch the Streamlit dashboard
 `pull` exit codes: `0` all configured devices succeeded · `2` partial failure · `1` no
 configured devices or all failed.
 
+### Live BLE heart-rate capture (Whoop + Fitbit Air)
+
+Requires the `ble` extra and a one-time Bluetooth permission grant to your
+terminal (System Settings → Privacy & Security → Bluetooth).
+
+    uv sync --extra ble --extra analysis
+    uv run wearable hr-scan                 # discover BLE addresses -> paste into .env
+    uv run wearable hr-capture --label bike # live capture; Ctrl-C to stop
+    uv run wearable hr-compare <session_id> # overlay chart + agreement stats
+
+Oura is not supported here — its ring does not broadcast live HR over BLE.
+
 ## Tests
 
 ```bash

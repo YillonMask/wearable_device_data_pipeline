@@ -171,6 +171,8 @@ def _settings_stub(tmp_path: Path) -> Settings:
         google_client_secret=None,
         google_redirect_uri=None,
         google_refresh_token=None,
+        whoop_ble_address=None,
+        fitbit_ble_address=None,
     )
 
 
