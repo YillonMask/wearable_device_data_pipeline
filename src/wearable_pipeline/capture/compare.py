@@ -108,3 +108,37 @@ def compute_stats(aligned: Any, rates: dict | None = None) -> dict:
                 stats["pearson_r"] = None
                 stats["spearman_rho"] = None
     return stats
+
+
+def render_chart(session_id: str, aligned: Any, stats: dict, out_path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    label_map = {"whoop": "Whoop", "google_health": "Fitbit Air"}
+    per_device = stats.get("per_device", {})
+    fig, ax = plt.subplots(figsize=(11, 5), dpi=120)
+    for device in aligned.columns:
+        name = label_map.get(device, device)
+        hz = per_device.get(device, {}).get("effective_hz")
+        label = f"{name} (~{hz} Hz)" if hz is not None else name
+        ax.plot(
+            [i / 60.0 for i in aligned.index],
+            aligned[device],
+            label=label,
+            lw=1.8,
+        )
+    ax.set_xlabel("elapsed (min)")
+    ax.set_ylabel("HR (bpm)")
+    ax.set_title(f"HR comparison — session {session_id}")
+    ax.legend()
+    subtitle = (
+        f"mean|Δ|={stats.get('mean_abs_diff')}  max|Δ|={stats.get('max_abs_diff')}  "
+        f"±5bpm={stats.get('pct_within_5')}%  r={stats.get('pearson_r')}  "
+        f"ρ={stats.get('spearman_rho')}  n={stats.get('n_overlap')}"
+    )
+    ax.annotate(subtitle, xy=(0.5, -0.18), xycoords="axes fraction", ha="center")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)

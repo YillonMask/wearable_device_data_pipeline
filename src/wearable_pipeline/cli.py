@@ -205,6 +205,70 @@ def hr_capture(
     )
 
 
+@app.command("hr-compare")
+def hr_compare(
+    session_id: str = typer.Argument(..., help="Session id (see hr_sessions.id)."),
+    out: str | None = typer.Option(None, "--out", help="Chart PNG path."),
+) -> None:
+    """Overlay + agreement stats for a captured HR session (needs `analysis`)."""
+    from pathlib import Path
+
+    from .storage import load_hr_session
+
+    settings = load_settings()
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+    try:
+        session, samples = load_hr_session(conn, session_id)
+    except KeyError:
+        typer.echo(f"No session {session_id!r}.", err=True)
+        raise typer.Exit(code=1)
+
+    # `align_series`/`compute_stats`/`render_chart` lazily import
+    # pandas/scipy/matplotlib inside their own bodies (Task 9's design), so
+    # the ImportError for a missing `analysis` extra only surfaces once one
+    # of them actually runs — not at the `from .capture.compare import ...`
+    # statement itself. Wrap the calls, not just the import, to catch it.
+    try:
+        from .capture.compare import (
+            align_series,
+            compute_stats,
+            render_chart,
+            series_rates,
+        )
+
+        aligned = align_series(samples)
+        rates = series_rates(samples)
+        stats = compute_stats(aligned, rates)
+    except ImportError:
+        typer.echo(
+            "pandas/scipy/matplotlib missing. Install with: `uv sync --extra analysis`",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    for k, v in stats.items():
+        if k != "per_device":
+            typer.echo(f"  {k}: {v}")
+    for device, d in stats["per_device"].items():
+        typer.echo(
+            f"  {device}: avg={d['avg']} max={d['max']} min={d['min']} "
+            f"n={d.get('n_samples')} rate={d.get('effective_hz')}Hz "
+            f"gap={d.get('median_gap_s')}s"
+        )
+
+    out_path = Path(out) if out else Path("data/hr_sessions") / f"{session_id}.png"
+    try:
+        render_chart(session_id, aligned, stats, out_path)
+    except ImportError:
+        typer.echo(
+            "pandas/scipy/matplotlib missing. Install with: `uv sync --extra analysis`",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    typer.echo(f"wrote {out_path}")
+
+
 @app.command()
 def pull(
     target_date: str = typer.Option(
