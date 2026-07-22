@@ -159,11 +159,13 @@ def hr_capture(
     }
     latest: dict[str, int] = {}
     buffer: list[tuple[str, str, str, int, int]] = []
+    sample_counts: dict[str, int] = {}
 
     def on_sample(sample) -> None:
         device, ts_utc, offset_ms, bpm = sample
         latest[device] = bpm
         buffer.append((session_id, device, ts_utc, offset_ms, bpm))
+        sample_counts[device] = sample_counts.get(device, 0) + 1
         if len(buffer) >= 5:
             insert_hr_samples(conn, buffer)
             buffer.clear()
@@ -177,7 +179,7 @@ def hr_capture(
             async def timer() -> None:
                 await asyncio.sleep(minutes * 60)
                 stop_event.set()
-            asyncio.create_task(timer())
+            timer_task = asyncio.create_task(timer())
         cap = asyncio.create_task(
             capture_session(addresses, start, on_sample, stop_event)
         )
@@ -188,9 +190,9 @@ def hr_capture(
             return await cap
 
     try:
-        counts = asyncio.run(_run())
+        asyncio.run(_run())
     except KeyboardInterrupt:  # pragma: no cover - interactive stop
-        counts = {}
+        pass
 
     if buffer:
         insert_hr_samples(conn, buffer)
@@ -198,7 +200,8 @@ def hr_capture(
         conn, session_id=session_id, ended_at=datetime.now(timezone.utc).isoformat()
     )
     typer.echo(
-        f"\nsession {session_id} ({label or 'unlabeled'}) done. samples: {counts}"
+        f"\nsession {session_id} ({label or 'unlabeled'}) done. "
+        f"samples: {sample_counts}"
     )
 
 

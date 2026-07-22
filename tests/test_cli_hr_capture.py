@@ -13,15 +13,7 @@ def test_hr_capture_missing_addresses(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "t.db"))
     monkeypatch.delenv("WHOOP_BLE_ADDRESS", raising=False)
     monkeypatch.delenv("FITBIT_BLE_ADDRESS", raising=False)
-    import importlib
     from wearable_pipeline import config
-    importlib.reload(config)
-    # `reload` re-runs `load_dotenv`, which re-populates os.environ from the
-    # real project `.env` for any var not already set — undoing the delenv
-    # above if this machine's .env happens to define these. Delenv again
-    # post-reload so the test is isolated from the real .env's contents.
-    monkeypatch.delenv("WHOOP_BLE_ADDRESS", raising=False)
-    monkeypatch.delenv("FITBIT_BLE_ADDRESS", raising=False)
     monkeypatch.setattr(cli, "load_settings", config.load_settings)
 
     result = runner.invoke(cli.app, ["hr-capture", "--minutes", "0"])
@@ -33,9 +25,7 @@ def test_hr_capture_records_samples(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "t.db"))
     monkeypatch.setenv("WHOOP_BLE_ADDRESS", "A")
     monkeypatch.setenv("FITBIT_BLE_ADDRESS", "B")
-    import importlib
     from wearable_pipeline import config
-    importlib.reload(config)
     monkeypatch.setattr(cli, "load_settings", config.load_settings)
 
     async def fake_capture(addresses, start, on_sample, stop_event, **kw):
