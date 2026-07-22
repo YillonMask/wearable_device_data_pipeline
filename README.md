@@ -78,15 +78,88 @@ configured devices or all failed.
 
 ### Live BLE heart-rate capture (Whoop + Fitbit Air)
 
-Requires the `ble` extra and a one-time Bluetooth permission grant to your
-terminal (System Settings → Privacy & Security → Bluetooth).
+The cloud APIs only return workout *summaries* (avg/max HR, duration, calories).
+To compare the two devices **second-by-second** during a workout, this captures
+their live heart-rate broadcast directly over Bluetooth LE — your Mac acts as a
+single receiver connected to both bands at once, so both streams share one clock
+and line up automatically.
 
-    uv sync --extra ble --extra analysis
-    uv run wearable hr-scan                 # discover BLE addresses -> paste into .env
-    uv run wearable hr-capture --label bike # live capture; Ctrl-C to stop
-    uv run wearable hr-compare <session_id> # overlay chart + agreement stats
+> Oura is **not** supported here — its ring doesn't broadcast live HR over BLE.
+> Stationary workouts only (indoor bike, treadmill, rower) — Bluetooth range is
+> ~10 m, so keep the Mac nearby.
 
-Oura is not supported here — its ring does not broadcast live HR over BLE.
+#### One-time setup
+
+1. **Install the extras** (`ble` for capture, `analysis` for the comparison chart):
+
+   ```bash
+   uv sync --extra ble --extra analysis
+   ```
+
+2. **Grant your terminal Bluetooth permission** — macOS blocks BLE otherwise:
+   System Settings → Privacy & Security → **Bluetooth** → enable your terminal
+   app (Terminal / iTerm), then restart it.
+
+3. **Turn on each device's HR broadcast:**
+   - **Whoop:** app → Device Settings → **HR Broadcast → ON**.
+   - **Fitbit Air:** Google Health app → Connections → **Share Heart Rate**, and
+     hold the device near the Mac. (Fitbit only streams *while this is active* —
+     see the note below.)
+
+4. **Discover the BLE addresses and save them to `.env`:**
+
+   ```bash
+   uv run wearable hr-scan
+   ```
+
+   With both broadcasts on, this lists nearby HR peripherals with their
+   addresses. Copy each into `.env` (they're long CoreBluetooth UUIDs on macOS):
+
+   ```bash
+   WHOOP_BLE_ADDRESS=93F56490-....
+   FITBIT_BLE_ADDRESS=240EA590-....
+   ```
+
+#### Capturing a session
+
+Make sure Whoop **HR Broadcast** and Fitbit **Share Heart Rate** are both live,
+then:
+
+```bash
+uv run wearable hr-capture --label bike        # capture until you stop it
+uv run wearable hr-capture --label bike --minutes 30   # ...or auto-stop after 30 min
+```
+
+A live line shows both devices so you can confirm each is connected:
+
+```
+WHOOP 142 | Fitbit Air 138 | Δ4
+```
+
+Whoop updates ~1×/second; Fitbit Air is slower (~1 sample every 2–3 s) and only
+while its Share Heart Rate is active — if it shows `0`, re-toggle the share. The
+session runs from launch until you **press Ctrl-C** (or `--minutes` elapses);
+there is no automatic workout detection. On stop it prints the session id and
+per-device sample counts:
+
+```
+session 20260721T203005Z (bike) done. samples: {'whoop': 312, 'google_health': 118}
+```
+
+#### Comparing the two curves
+
+```bash
+uv run wearable hr-compare 20260721T203005Z    # use the id printed above
+```
+
+This prints agreement stats (mean/max |Δ|, % within ±5 bpm, Pearson/Spearman)
+and each device's effective sampling rate, and writes an overlay chart to
+`data/hr_sessions/<session_id>.png`. Because Fitbit samples slower than Whoop,
+its series is step-interpolated onto Whoop's 1 Hz grid rather than dropped, and
+its true rate is reported alongside the stats.
+
+Data lands in the existing SQLite DB (`hr_sessions` + `hr_samples`); charts go
+under the git-ignored `data/` directory.
 
 ## Tests
 
