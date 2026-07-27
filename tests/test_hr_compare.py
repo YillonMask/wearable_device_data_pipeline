@@ -50,6 +50,40 @@ def test_stats_over_step_filled_grid():
     assert stats["per_device"]["whoop"]["n_samples"] == 10
 
 
+def _baseline_samples():
+    """Strap baseline + Whoop (offset +1) + Fitbit (offset -3), all 1 Hz, 10 s."""
+    out = []
+    for sec in range(10):
+        out.append({"device": "strap", "ts_utc": "x", "t_offset_ms": sec * 1000, "bpm": 120 + sec})
+        out.append({"device": "whoop", "ts_utc": "x", "t_offset_ms": sec * 1000, "bpm": 121 + sec})
+        out.append({"device": "google_health", "ts_utc": "x", "t_offset_ms": sec * 1000, "bpm": 117 + sec})
+    return out
+
+
+def test_baseline_reports_each_device_vs_strap():
+    samples = _baseline_samples()
+    stats = compute_stats(align_series(samples), series_rates(samples), baseline="strap")
+    assert stats["baseline"] == "strap"
+    # one pair per non-baseline device; strap is not compared against itself
+    assert set(stats["pairs"]) == {"whoop", "google_health"}
+    assert stats["pairs"]["whoop"]["mean_abs_diff"] == 1.0   # constant +1 vs strap
+    assert stats["pairs"]["google_health"]["mean_abs_diff"] == 3.0  # constant -3
+    assert stats["pairs"]["whoop"]["pct_within_5"] == 100.0
+    assert stats["pairs"]["whoop"]["n_overlap"] == 10
+    # per_device summaries still present for all three
+    assert set(stats["per_device"]) == {"strap", "whoop", "google_health"}
+    # legacy top-level agreement keys are absent in baseline mode
+    assert "mean_abs_diff" not in stats
+
+
+def test_baseline_absent_falls_back_to_legacy_pair():
+    # baseline=None keeps the two-device top-level agreement shape
+    samples = _samples()
+    stats = compute_stats(align_series(samples), series_rates(samples), baseline=None)
+    assert "pairs" not in stats
+    assert "mean_abs_diff" in stats
+
+
 def test_max_hold_expires_into_gap():
     # Fitbit sample only at t=0; with a 3 s hold it should NaN out after sec 3.
     samples = [{"device": "whoop", "ts_utc": "x", "t_offset_ms": s * 1000, "bpm": 120 + s} for s in range(10)]

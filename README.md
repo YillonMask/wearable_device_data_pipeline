@@ -76,13 +76,20 @@ uv run wearable viz                             # launch the Streamlit dashboard
 `pull` exit codes: `0` all configured devices succeeded · `2` partial failure · `1` no
 configured devices or all failed.
 
-### Live BLE heart-rate capture (Whoop + Fitbit Air)
+### Live BLE heart-rate capture (Whoop + Fitbit Air, + optional chest-strap baseline)
 
 The cloud APIs only return workout *summaries* (avg/max HR, duration, calories).
-To compare the two devices **second-by-second** during a workout, this captures
+To compare the devices **second-by-second** during a workout, this captures
 their live heart-rate broadcast directly over Bluetooth LE — your Mac acts as a
-single receiver connected to both bands at once, so both streams share one clock
+single receiver connected to every band at once, so all streams share one clock
 and line up automatically.
+
+> **Add a chest strap as a ground-truth baseline.** A standard BLE HR strap
+> (Polar H10, Wahoo TICKR, …) is the accepted reference for HR accuracy. Set
+> `STRAP_BLE_ADDRESS` and it's captured alongside the wearables; `hr-compare`
+> then reports each wearable's error *against the strap* instead of just
+> wearable-vs-wearable. The strap is optional — without it, capture/compare
+> behave exactly as before.
 
 > Oura is **not** supported here — its ring doesn't broadcast live HR over BLE.
 > Stationary workouts only (indoor bike, treadmill, rower) — Bluetooth range is
@@ -105,6 +112,8 @@ and line up automatically.
    - **Fitbit Air:** Google Health app → Connections → **Share Heart Rate**, and
      hold the device near the Mac. (Fitbit only streams *while this is active* —
      see the note below.)
+   - **Chest strap (optional):** wet the electrodes and put it on — most straps
+     broadcast standard BLE HR automatically once worn.
 
 4. **Discover the BLE addresses and save them to `.env`:**
 
@@ -112,12 +121,13 @@ and line up automatically.
    uv run wearable hr-scan
    ```
 
-   With both broadcasts on, this lists nearby HR peripherals with their
+   With the broadcasts on, this lists nearby HR peripherals with their
    addresses. Copy each into `.env` (they're long CoreBluetooth UUIDs on macOS):
 
    ```bash
    WHOOP_BLE_ADDRESS=93F56490-....
    FITBIT_BLE_ADDRESS=240EA590-....
+   STRAP_BLE_ADDRESS=1C4E9A20-....   # optional ground-truth baseline
    ```
 
 #### Capturing a session
@@ -130,33 +140,40 @@ uv run wearable hr-capture --label bike        # capture until you stop it
 uv run wearable hr-capture --label bike --minutes 30   # ...or auto-stop after 30 min
 ```
 
-A live line shows both devices so you can confirm each is connected:
+A live line shows every connected device so you can confirm each is streaming.
+Whichever BLE addresses are set are captured; you need at least two. When a
+strap is present it's shown first and each wearable is annotated with its delta
+vs the strap:
 
 ```
-WHOOP 142 | Fitbit Air 138 | Δ4
+Strap 140 | WHOOP 142 (Δ  2) | Fitbit 138 (Δ  2)
 ```
 
-Whoop updates ~1×/second; Fitbit Air is slower (~1 sample every 2–3 s) and only
-while its Share Heart Rate is active — if it shows `0`, re-toggle the share. The
-session runs from launch until you **press Ctrl-C** (or `--minutes` elapses);
-there is no automatic workout detection. On stop it prints the session id and
-per-device sample counts:
+Whoop and the strap update ~1×/second; Fitbit Air is slower (~1 sample every
+2–3 s) and only while its Share Heart Rate is active — if it shows `0`, re-toggle
+the share. The session runs from launch until you **press Ctrl-C** (or
+`--minutes` elapses); there is no automatic workout detection. On stop it prints
+the session id and per-device sample counts:
 
 ```
-session 20260721T203005Z (bike) done. samples: {'whoop': 312, 'google_health': 118}
+session 20260721T203005Z (bike) done. samples: {'strap': 605, 'whoop': 312, 'google_health': 118}
 ```
 
-#### Comparing the two curves
+#### Comparing the curves
 
 ```bash
 uv run wearable hr-compare 20260721T203005Z    # use the id printed above
 ```
 
-This prints agreement stats (mean/max |Δ|, % within ±5 bpm, Pearson/Spearman)
-and each device's effective sampling rate, and writes an overlay chart to
-`data/hr_sessions/<session_id>.png`. Because Fitbit samples slower than Whoop,
-its series is step-interpolated onto Whoop's 1 Hz grid rather than dropped, and
-its true rate is reported alongside the stats.
+This writes an overlay chart to `data/hr_sessions/<session_id>.png` and prints
+agreement stats (mean/median/max |Δ|, % within ±5 bpm, Pearson/Spearman) plus
+each device's effective sampling rate. **When the session includes a strap, it's
+the baseline** (drawn in black on the chart) and the stats are reported per
+wearable *against the strap* — e.g. `whoop vs strap` and `google_health vs
+strap`. Without a strap, a two-device session reports the single pairwise
+agreement as before. Because Fitbit samples slower than the others, its series
+is step-interpolated onto the shared 1 Hz grid rather than dropped, and its true
+rate is reported alongside the stats.
 
 Data lands in the existing SQLite DB (`hr_sessions` + `hr_samples`); charts go
 under the git-ignored `data/` directory.

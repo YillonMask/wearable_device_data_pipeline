@@ -173,6 +173,7 @@ def _settings_stub(tmp_path: Path) -> Settings:
         google_refresh_token=None,
         whoop_ble_address=None,
         fitbit_ble_address=None,
+        strap_ble_address=None,
     )
 
 

@@ -28,6 +28,7 @@ class Settings:
     google_refresh_token: str | None
     whoop_ble_address: str | None
     fitbit_ble_address: str | None
+    strap_ble_address: str | None
 
 
 def _opt(name: str) -> str | None:
@@ -51,4 +52,5 @@ def load_settings() -> Settings:
         google_refresh_token=_opt("GOOGLE_HEALTH_REFRESH_TOKEN"),
         whoop_ble_address=_opt("WHOOP_BLE_ADDRESS"),
         fitbit_ble_address=_opt("FITBIT_BLE_ADDRESS"),
+        strap_ble_address=_opt("STRAP_BLE_ADDRESS"),
     )
