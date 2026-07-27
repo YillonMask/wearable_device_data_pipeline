@@ -232,14 +232,24 @@ it does not implement the `WearableClient` HTTP protocol used by `clients/`,
 since it talks to devices directly over Bluetooth rather than a vendor API.
 
 - Commands: `wearable hr-scan` (discover nearby BLE HR peripherals), `wearable
-  hr-capture` (live dual-device capture into `hr_sessions`/`hr_samples`), and
+  hr-capture` (live multi-device capture into `hr_sessions`/`hr_samples`), and
   `wearable hr-compare <session_id>` (overlay chart + agreement stats; needs
   the `analysis` extra).
 - Device BLE addresses live in `.env` as `WHOOP_BLE_ADDRESS` /
-  `FITBIT_BLE_ADDRESS`, discovered via `hr-scan` — there's no vendor API for
-  BLE peripheral discovery, so this is a manual one-time pairing step per
-  device. `google_health` is the device key for Fitbit Air here too, same as
-  the HTTP client.
+  `FITBIT_BLE_ADDRESS` / `STRAP_BLE_ADDRESS`, discovered via `hr-scan` —
+  there's no vendor API for BLE peripheral discovery, so this is a manual
+  one-time pairing step per device. `google_health` is the device key for
+  Fitbit Air here too, same as the HTTP client.
+- **The chest strap is the ground-truth baseline.** `STRAP_BLE_ADDRESS` is
+  optional and uses device key `strap`. `hr-capture` records every configured
+  BLE address concurrently (needs ≥2; `ble_hr.capture_session` already takes an
+  arbitrary `{device: address}` and is partial-failure tolerant). When a
+  `strap` device is present, `hr-compare` passes `baseline="strap"` to
+  `compare.compute_stats`, which returns `{baseline, pairs}` — each wearable's
+  agreement *against the strap* — instead of the legacy top-level single-pair
+  keys. No baseline (or a pre-strap 2-device session) keeps the old flat shape.
+  Adding another strap/reference = new `*_BLE_ADDRESS` in `config.py` + include
+  it in the `candidates` dict in `cli.py:hr_capture`.
 - **BPM only** — RR intervals / HRV are out of scope; the HR Measurement
   characteristic parser only extracts heart rate.
 - **Fitbit only streams while its "Share Heart Rate" toggle is actively live**

@@ -128,11 +128,25 @@ def hr_capture(
         None, "--minutes", help="Auto-stop after N minutes (else Ctrl-C)."
     ),
 ) -> None:
-    """Capture live HR from Whoop + Fitbit Air over BLE into the DB."""
+    """Capture live HR from Whoop + Fitbit Air (+ optional chest strap) over BLE.
+
+    A configured STRAP_BLE_ADDRESS is captured as the ground-truth baseline
+    alongside the wearables; `hr-compare` then reports each wearable's error
+    against it. Devices are captured concurrently (partial-failure tolerant).
+    """
     settings = load_settings()
-    if not settings.whoop_ble_address or not settings.fitbit_ble_address:
+    # `strap` first so it reads as the reference in the live status line and
+    # the stored device order. Include only devices with a configured address.
+    candidates = {
+        "strap": settings.strap_ble_address,
+        "whoop": settings.whoop_ble_address,
+        "google_health": settings.fitbit_ble_address,
+    }
+    addresses = {device: addr for device, addr in candidates.items() if addr}
+    if len(addresses) < 2:
         typer.echo(
-            "WHOOP_BLE_ADDRESS / FITBIT_BLE_ADDRESS missing from .env. "
+            "Need at least two BLE addresses to compare. Set STRAP_BLE_ADDRESS "
+            "plus WHOOP_BLE_ADDRESS / FITBIT_BLE_ADDRESS in .env. "
             "Run `wearable hr-scan` to discover them.",
             err=True,
         )
@@ -144,7 +158,7 @@ def hr_capture(
 
     start = datetime.now(timezone.utc)
     session_id = start.strftime("%Y%m%dT%H%M%SZ")
-    devices = ["whoop", "google_health"]
+    devices = list(addresses.keys())
     create_hr_session(
         conn,
         session_id=session_id,
@@ -152,14 +166,11 @@ def hr_capture(
         started_at=start.isoformat(),
         devices=devices,
     )
-
-    addresses = {
-        "whoop": settings.whoop_ble_address,
-        "google_health": settings.fitbit_ble_address,
-    }
     latest: dict[str, int] = {}
     buffer: list[tuple[str, str, str, int, int]] = []
     sample_counts: dict[str, int] = {}
+
+    status_labels = {"strap": "Strap", "whoop": "WHOOP", "google_health": "Fitbit"}
 
     def on_sample(sample) -> None:
         device, ts_utc, offset_ms, bpm = sample
@@ -169,9 +180,18 @@ def hr_capture(
         if len(buffer) >= 5:
             insert_hr_samples(conn, buffer)
             buffer.clear()
-        w = latest.get("whoop", 0)
-        f = latest.get("google_health", 0)
-        typer.echo(f"\rWHOOP {w:>3} | Fitbit Air {f:>3} | Δ{abs(w - f):>3}", nl=False)
+        # Live line: show each device's latest bpm; when a strap baseline is
+        # present, annotate each wearable with its delta vs the strap.
+        base = latest.get("strap")
+        parts = []
+        for d in devices:
+            val = latest.get(d, 0)
+            name = status_labels.get(d, d)
+            if d != "strap" and base is not None:
+                parts.append(f"{name} {val:>3} (Δ{abs(val - base):>3})")
+            else:
+                parts.append(f"{name} {val:>3}")
+        typer.echo("\r" + " | ".join(parts), nl=False)
 
     async def _run() -> dict[str, int]:
         stop_event = asyncio.Event()
@@ -239,7 +259,10 @@ def hr_compare(
 
         aligned = align_series(samples)
         rates = series_rates(samples)
-        stats = compute_stats(aligned, rates)
+        # When a chest strap is in the session, treat it as the ground-truth
+        # baseline: each wearable's agreement is reported against the strap.
+        baseline = "strap" if "strap" in aligned.columns else None
+        stats = compute_stats(aligned, rates, baseline=baseline)
     except ImportError:
         typer.echo(
             "pandas/scipy/matplotlib missing. Install with: `uv sync --extra analysis`",
@@ -247,9 +270,22 @@ def hr_compare(
         )
         raise typer.Exit(code=2)
 
-    for k, v in stats.items():
-        if k != "per_device":
-            typer.echo(f"  {k}: {v}")
+    if stats.get("pairs"):
+        typer.echo(f"  baseline: {stats['baseline']}")
+        for device, p in stats["pairs"].items():
+            typer.echo(
+                f"  {device} vs {stats['baseline']}: "
+                f"mean_abs_diff={p.get('mean_abs_diff')} "
+                f"median_abs_diff={p.get('median_abs_diff')} "
+                f"max_abs_diff={p.get('max_abs_diff')} "
+                f"pct_within_5={p.get('pct_within_5')} "
+                f"pearson_r={p.get('pearson_r')} spearman_rho={p.get('spearman_rho')} "
+                f"n_overlap={p['n_overlap']}"
+            )
+    else:
+        for k, v in stats.items():
+            if k != "per_device":
+                typer.echo(f"  {k}: {v}")
     for device, d in stats["per_device"].items():
         typer.echo(
             f"  {device}: avg={d['avg']} max={d['max']} min={d['min']} "
