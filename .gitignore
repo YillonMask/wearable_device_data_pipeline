@@ -7,7 +7,8 @@ venv/
 
 .env
 
-data/
+data/*
+!data/hr_sessions/
 *.db
 *.db-journal
 *.sqlite
