@@ -22,6 +22,10 @@ class Settings:
     whoop_client_secret: str | None
     whoop_redirect_uri: str | None
     whoop_refresh_token: str | None
+    # Account credentials, only for the internal per-sample HR endpoint
+    # (clients/whoop_internal.py) — the OAuth pair above cannot reach it.
+    whoop_username: str | None
+    whoop_password: str | None
     google_client_id: str | None
     google_client_secret: str | None
     google_redirect_uri: str | None
@@ -46,6 +50,8 @@ def load_settings() -> Settings:
         whoop_client_secret=_opt("WHOOP_CLIENT_SECRET"),
         whoop_redirect_uri=_opt("WHOOP_REDIRECT_URI"),
         whoop_refresh_token=_opt("WHOOP_REFRESH_TOKEN"),
+        whoop_username=_opt("WHOOP_USERNAME"),
+        whoop_password=_opt("WHOOP_PASSWORD"),
         google_client_id=_opt("GOOGLE_HEALTH_CLIENT_ID"),
         google_client_secret=_opt("GOOGLE_HEALTH_CLIENT_SECRET"),
         google_redirect_uri=_opt("GOOGLE_HEALTH_REDIRECT_URI"),

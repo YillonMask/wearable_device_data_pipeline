@@ -167,6 +167,8 @@ def _settings_stub(tmp_path: Path) -> Settings:
         whoop_client_secret=None,
         whoop_redirect_uri=None,
         whoop_refresh_token=None,
+        whoop_username=None,
+        whoop_password=None,
         google_client_id=None,
         google_client_secret=None,
         google_redirect_uri=None,

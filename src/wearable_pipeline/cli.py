@@ -9,7 +9,11 @@ from . import db
 from .auth.google_flow import run_interactive_flow as run_google_flow
 from .auth.whoop_flow import run_interactive_flow as run_whoop_flow
 from .capture.ble_hr import capture_session, scan_hr_peripherals
+# series_rates is stdlib-only (pandas/scipy live behind lazy imports in the
+# other compare helpers), so it is safe to import without the `analysis` extra.
+from .capture.compare import series_rates
 from .clients._oauth import update_env_var
+from .clients.whoop_internal import VALID_STEPS, WhoopInternalClient
 from .config import load_settings
 from .logging_setup import configure_logging
 from .orchestrator import (
@@ -21,11 +25,16 @@ from .orchestrator import (
     summarize,
 )
 from .storage import (
+    add_hr_session_device,
     create_hr_session,
     end_hr_session,
+    hr_session_exists,
     insert_hr_samples,
+    load_hr_session,
+    load_workouts,
     upsert_manual_readiness,
     upsert_self_report,
+    write_raw_payload,
 )
 
 app = typer.Typer(help="Multi-wearable health data pipeline.")
@@ -233,8 +242,6 @@ def hr_compare(
     """Overlay + agreement stats for a captured HR session (needs `analysis`)."""
     from pathlib import Path
 
-    from .storage import load_hr_session
-
     settings = load_settings()
     conn = db.connect(settings.database_path)
     db.migrate(conn)
@@ -250,15 +257,18 @@ def hr_compare(
     # of them actually runs — not at the `from .capture.compare import ...`
     # statement itself. Wrap the calls, not just the import, to catch it.
     try:
-        from .capture.compare import (
-            align_series,
-            compute_stats,
-            render_chart,
-            series_rates,
-        )
+        from .capture.compare import align_series, compute_stats, render_chart
 
-        aligned = align_series(samples)
         rates = series_rates(samples)
+        # BLE capture lands ~1-2.5 s apart, well inside align_series' 8 s default
+        # hold. An API import (`hr-import-whoop`) is 6 s at best and 60/600 s if
+        # asked for, which would step off the end of that hold and render as an
+        # all-NaN column. Hold for twice the widest median gap so coarse imported
+        # sessions still draw; BLE sessions stay on the 8 s default.
+        gaps = [r["median_gap_s"] for r in rates.values() if r["median_gap_s"]]
+        aligned = align_series(
+            samples, max_hold_s=max(8, int(max(gaps) * 2)) if gaps else 8
+        )
         # When a chest strap is in the session, treat it as the ground-truth
         # baseline: each wearable's agreement is reported against the strap.
         baseline = "strap" if "strap" in aligned.columns else None
@@ -303,6 +313,163 @@ def hr_compare(
         )
         raise typer.Exit(code=2)
     typer.echo(f"wrote {out_path}")
+
+
+@app.command("hr-import-whoop")
+def hr_import_whoop(
+    date_str: str | None = typer.Option(
+        None,
+        "--date",
+        help="Local date of the workout(s): YYYY-MM-DD | today | yesterday.",
+    ),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Merge into an existing hr_session (see hr_sessions.id), using its window.",
+    ),
+    workout: str | None = typer.Option(
+        None, "--workout", help="With --date: import only this Whoop provider_id."
+    ),
+    step: int = typer.Option(
+        6, "--step", help="Bucket seconds (6 | 60 | 600). 6 is the finest Whoop returns."
+    ),
+) -> None:
+    """Import per-sample Whoop workout HR from the internal web-app API.
+
+    The public developer API reports only average/max HR per workout. This pulls
+    the underlying series Whoop charts in its own app and lands it in
+    `hr_sessions`/`hr_samples`, so `hr-compare` reads it like a BLE capture.
+    Needs WHOOP_USERNAME / WHOOP_PASSWORD in .env (account login, not OAuth).
+
+    Two ways in:
+
+    --date  imports each stored Whoop workout that day into its own session.
+            Requires `wearable pull --date <date>` to have run first (OAuth).
+
+    --session  fetches the window of an existing BLE capture and merges the
+            result into that same session as device `whoop_api`, so hr-compare
+            puts it right beside the chest-strap baseline — and fills the
+            stretches where the BLE stream dropped out. Needs no OAuth setup.
+    """
+    if not (settings := load_settings()).whoop_username or not settings.whoop_password:
+        typer.echo(
+            "WHOOP_USERNAME / WHOOP_PASSWORD missing from .env. The internal HR "
+            "endpoint authenticates against your Whoop *account* login — the "
+            "OAuth client credentials cannot reach it.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if step not in VALID_STEPS:
+        typer.echo(
+            f"--step must be one of {', '.join(str(s) for s in VALID_STEPS)}; "
+            "Whoop quantizes anything else server-side.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if (date_str is None) == (session is None):
+        typer.echo("Pass exactly one of --date or --session.", err=True)
+        raise typer.Exit(code=2)
+
+    configure_logging()
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+    client = WhoopInternalClient(
+        username=settings.whoop_username, password=settings.whoop_password
+    )
+
+    if session is not None:
+        _import_into_session(conn, client, session, step)
+        return
+
+    day = _parse_date(date_str)
+    workouts = load_workouts(conn, device="whoop", day=day.isoformat())
+    if workout:
+        workouts = [w for w in workouts if w["provider_id"] == workout]
+    if not workouts:
+        typer.echo(
+            f"No Whoop workouts stored for {day.isoformat()}. Run "
+            f"`wearable pull --date {day.isoformat()}` first.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    imported = 0
+    for record in workouts:
+        provider_id = record["provider_id"]
+        sport = record["sport"] or "workout"
+        if not record["end_time"]:
+            typer.echo(f"  {sport} {provider_id}: skipped (no end_time)", err=True)
+            continue
+        start = datetime.fromisoformat(record["start_time"])
+        end = datetime.fromisoformat(record["end_time"])
+        try:
+            series = client.fetch_heart_rate(start, end, step=step)
+        except Exception as exc:  # network, auth, or shape change — keep going
+            typer.echo(f"  {sport} {provider_id}: FAIL {exc}", err=True)
+            continue
+
+        # Raw first, always — even a zero-sample response is evidence about
+        # whether this undocumented endpoint changed shape on us.
+        write_raw_payload(
+            conn,
+            device="whoop",
+            endpoint=series.raw.endpoint,
+            date=series.raw.date,
+            payload=series.raw.payload,
+        )
+        if not series.samples:
+            typer.echo(f"  {sport} {provider_id}: no samples returned")
+            continue
+
+        # Anchor the session at the earlier of workout start and first sample:
+        # Whoop's buckets align to step boundaries and can begin just before the
+        # workout, and t_offset_ms must stay non-negative for align_series.
+        session_start = min(start, series.samples[0][0])
+        # `-whoop` suffix keeps API imports in their own id space, so they can
+        # never collide with a live BLE session started the same second.
+        session_id = f"{session_start.strftime('%Y%m%dT%H%M%SZ')}-whoop"
+        if not hr_session_exists(conn, session_id):
+            create_hr_session(
+                conn,
+                session_id=session_id,
+                label=sport,
+                started_at=session_start.isoformat(),
+                devices=["whoop"],
+            )
+        # PK is (session_id, device, ts_utc) and the timestamps are deterministic,
+        # so INSERT OR IGNORE makes re-importing the same workout a no-op.
+        insert_hr_samples(
+            conn,
+            [
+                (
+                    session_id,
+                    "whoop",
+                    ts.isoformat(),
+                    int((ts - session_start).total_seconds() * 1000),
+                    bpm,
+                )
+                for ts, bpm in series.samples
+            ],
+        )
+        end_hr_session(conn, session_id=session_id, ended_at=end.isoformat())
+
+        _, stored = load_hr_session(conn, session_id)
+        rate = series_rates(stored).get("whoop", {})
+        bpms = [s["bpm"] for s in stored]
+        typer.echo(
+            f"  {sport} {provider_id} -> session {session_id}: "
+            f"n={len(stored)} spacing={rate.get('median_gap_s')}s "
+            f"avg={round(sum(bpms) / len(bpms), 1)} max={max(bpms)} "
+            f"(API summary avg={record['avg_hr']} max={record['max_hr']})"
+        )
+        imported += 1
+
+    if not imported:
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"imported {imported} session(s). Chart one with "
+        "`uv run wearable hr-compare <session_id>`."
+    )
 
 
 @app.command()
@@ -570,6 +737,79 @@ def backfill(
         raise typer.Exit(code=1)
     if failures > 0:
         raise typer.Exit(code=2)
+
+
+def _import_into_session(
+    conn, client: WhoopInternalClient, session_id: str, step: int
+) -> None:
+    """Merge Whoop's stored HR for an existing session's window into that session.
+
+    Lands under device key `whoop_api` so it sits *alongside* — never on top of —
+    the `whoop` series the BLE capture recorded live. That's the point: the two
+    are independent measurements of the same wrist, and the API series covers the
+    stretches where BLE dropped out (a swimmer underwater, say).
+    """
+    try:
+        session, _ = load_hr_session(conn, session_id)
+    except KeyError:
+        typer.echo(f"No session {session_id!r}.", err=True)
+        raise typer.Exit(code=1)
+    if not session["ended_at"]:
+        typer.echo(
+            f"Session {session_id} has no ended_at — can't bound the fetch.", err=True
+        )
+        raise typer.Exit(code=1)
+
+    start = datetime.fromisoformat(session["started_at"])
+    end = datetime.fromisoformat(session["ended_at"])
+    try:
+        series = client.fetch_heart_rate(start, end, step=step)
+    except Exception as exc:
+        typer.echo(f"FAIL {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    write_raw_payload(
+        conn,
+        device="whoop",
+        endpoint=series.raw.endpoint,
+        date=series.raw.date,
+        payload=series.raw.payload,
+    )
+
+    # This session's anchor is already fixed by the BLE capture, so drop any
+    # bucket predating it rather than emitting a negative t_offset_ms.
+    rows = [
+        (
+            session_id,
+            "whoop_api",
+            ts.isoformat(),
+            int((ts - start).total_seconds() * 1000),
+            bpm,
+        )
+        for ts, bpm in series.samples
+        if ts >= start
+    ]
+    if not rows:
+        typer.echo(
+            f"No samples returned for {session_id} "
+            f"({start:%Y-%m-%d %H:%M}–{end:%H:%M} UTC)."
+        )
+        raise typer.Exit(code=1)
+
+    insert_hr_samples(conn, rows)
+    add_hr_session_device(conn, session_id=session_id, device="whoop_api")
+
+    _, stored = load_hr_session(conn, session_id)
+    typer.echo(f"session {session_id} ({session['label'] or 'unlabeled'}):")
+    for device, rate in series_rates(stored).items():
+        typer.echo(
+            f"  {device}: n={rate['n']} spacing={rate['median_gap_s']}s "
+            f"rate={rate['effective_hz']}Hz"
+        )
+    typer.echo(
+        f"added {len(rows)} whoop_api samples. Chart it with "
+        f"`uv run wearable hr-compare {session_id}`."
+    )
 
 
 def _parse_date(value: str) -> date:

@@ -151,6 +151,47 @@ def end_hr_session(
     conn.commit()
 
 
+def hr_session_exists(conn: sqlite3.Connection, session_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM hr_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    return row is not None
+
+
+def add_hr_session_device(
+    conn: sqlite3.Connection, *, session_id: str, device: str
+) -> None:
+    """Append a device to a session's JSON device list, if not already there."""
+    row = conn.execute(
+        "SELECT devices FROM hr_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"no hr_session with id {session_id!r}")
+    devices = json.loads(row["devices"]) if row["devices"] else []
+    if device in devices:
+        return
+    devices.append(device)
+    conn.execute(
+        "UPDATE hr_sessions SET devices = ? WHERE id = ?",
+        (json.dumps(devices), session_id),
+    )
+    conn.commit()
+
+
+def load_workouts(
+    conn: sqlite3.Connection, *, device: str, day: str
+) -> list[dict]:
+    """Stored workouts for one device on one local-tz date, earliest first."""
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT provider_id, sport, start_time, end_time, avg_hr, max_hr "
+            "FROM workouts WHERE device = ? AND date = ? ORDER BY start_time",
+            (device, day),
+        )
+    ]
+
+
 def load_hr_session(
     conn: sqlite3.Connection, session_id: str
 ) -> tuple[dict, list[dict]]:

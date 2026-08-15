@@ -41,6 +41,7 @@ uv run wearable pull --date 2026-06-12           # pull a specific day
 uv run wearable backfill --since 2026-05-23      # walk every day from --since to yesterday
 uv run wearable backfill --since 2026-05-23 --skip-existing  # idempotent re-run, skip complete days
 uv run wearable analyze --since 2026-05-23       # Spearman rank correlation across device pairs
+uv run wearable hr-import-whoop --date today     # per-sample (6s) Whoop workout HR -> hr_sessions
 
 uv sync --extra viz                              # install Streamlit + pandas/scipy for the UI
 uv run wearable viz                              # launch the Streamlit dashboard at http://localhost:8501
@@ -218,6 +219,22 @@ The spec breaks the build into 6 phases. Phase 1 (scaffold) is done. The expecta
 - **Workouts are at `/developer/v2/activity/workout`** (`clients/whoop.py:fetch_workouts`). Per-record: `sport_name`, `start`/`end`, `score.average_heart_rate`, `score.max_heart_rate`, `score.kilojoule` (→ kcal via `_kj_to_kcal`). Unlike Google Health, Whoop **does** expose per-workout `max_heart_rate`.
 - **Pagination key asymmetry (verified live 2026-06-26):** the workout list response returns the cursor under `next_token` (snake_case), but the request query param to fetch the next page is `nextToken` (camelCase). Confirmed empirically: passing `next_token` as the param does NOT advance; `nextToken` does. `fetch_workouts` reads `body["next_token"]` and sends `params["nextToken"]` — both are correct, do not "fix" the asymmetry.
 
+### Per-sample workout HR is NOT in the public API — use the internal endpoint
+
+- **`/developer/v2` has no heart-rate time series at all.** The full v2 endpoint list is cycle / recovery / sleep / workout / user / partner; `workout.score` tops out at `average_heart_rate`, `max_heart_rate` and `zone_durations`. The member CSV data export is aggregate-only too. Don't go looking for a `step`/`samples` param on the public workout endpoint — there isn't one.
+- **The web app's own HR graph is powered by an internal endpoint**, implemented in `clients/whoop_internal.py` and exposed as `wearable hr-import-whoop --date <D>`:
+  ```
+  GET https://api.prod.whoop.com/metrics-service/v1/metrics/user/{user_id}
+      ?name=heart_rate&start=<iso_ms>&end=<iso_ms>&step=<s>&apiVersion=7
+  -> {"values": [{"time": <unix_ms>, "data": <bpm>}, ...]}
+  ```
+- **It authenticates against the member's account login, not OAuth.** `POST /auth-service/v2/whoop/sign-in` with `{username, password}` → `access_token` (+ `user.id`, else `GET /auth-service/v2/user`). The developer OAuth token from `whoop.py` is rejected. Credentials are `WHOOP_USERNAME` / `WHOOP_PASSWORD` in `.env`. There's no documented refresh grant — on 401 the client just re-runs sign-in.
+- **6 seconds is the retrospective floor.** `step` accepts 6 / 60 / 600 only; the web app never asks for anything else and Whoop quantizes server-side. **True 1 Hz Whoop HR exists only on the live BLE broadcast** (`capture/ble_hr.py`) and cannot be recovered after the fact — so `hr-import-whoop` reports the spacing actually delivered rather than the step requested. Don't promise "per-second" from this endpoint.
+- **Keep it isolated from `clients/whoop.py`.** It's unofficial, undocumented and can change without notice; a break here must never take down the daily metrics pull. It deliberately does not implement the `WearableClient` protocol.
+- **Two entry points.** `--date <D>` imports each stored Whoop workout that day into its own session id `<workout_start>-whoop` (the suffix can never collide with a live BLE session started the same second); it needs the `workouts` table populated, so it depends on OAuth via `wearable pull`. `--session <hr_session_id>` needs no OAuth at all — it takes an existing BLE capture's window and merges Whoop's stored series into that same session under device key **`whoop_api`**, sitting alongside (never overwriting) the live `whoop` BLE series. That's the one to reach for when comparing against the chest-strap baseline or filling an underwater BLE dropout.
+- Re-importing either way is idempotent — `hr_samples`' PK is `(session_id, device, ts_utc)` and the bucket timestamps are deterministic, so `INSERT OR IGNORE` no-ops.
+- `hr-compare` derives its `max_hold_s` from each series' observed median gap (`max(8, 2 × widest gap)`) so a 6 s (or coarser) imported series doesn't step off the end of `align_series`' 8 s default hold and render as an all-NaN column. BLE-only sessions are unaffected.
+
 ## Oura API gotchas (learned from Phase 2)
 
 - **Don't query single-day windows.** `start_date == end_date` silently returns `data: []` even when records exist for that day, on all four endpoints (`/v2/usercollection/{daily_sleep,daily_readiness,daily_activity,sleep}`). The filter applies to a timezone-bearing timestamp, not the response's `day` field. Solution: always query `day-1 .. day+1` and post-filter to records where `data[].day == target.isoformat()`. This pattern is implemented in `clients/oura.py:fetch_day`.
@@ -252,6 +269,30 @@ since it talks to devices directly over Bluetooth rather than a vendor API.
   it in the `candidates` dict in `cli.py:hr_capture`.
 - **BPM only** — RR intervals / HRV are out of scope; the HR Measurement
   characteristic parser only extracts heart rate.
+- **A device that disconnects mid-session keeps retrying for the rest of the
+  session — it never permanently gives up while `stop_event` is unset.**
+  `ble_hr.capture_session`'s `run_device` retries at a fast 1s interval for
+  the first `reconnect_attempts` failures, then backs off to
+  `retry_backoff_s` (default 10s) so a device that's genuinely unreachable
+  for a long stretch (e.g. a swimmer out of BLE range underwater) doesn't
+  hammer the BLE stack or spam logs — but it keeps trying, so a wall touch or
+  resurfacing mid-swim picks the stream back up automatically instead of
+  leaving that device dead for the rest of the session. The backoff sleep
+  itself is interruptible (`asyncio.wait_for` on `stop_event`), so stopping a
+  session never stalls waiting out another device's backoff.
+- **BLE physically cannot reach a submerged/distant peripheral** — the
+  retry logic above only recovers gaps near the surface (wall touches, flip
+  turns); it can't fix genuine underwater dead zones. For full continuous-swim
+  HR, the only path is a retrospective pull from Google Health API v4's
+  `heart-rate` data type via `dataTypes/heart-rate/dataPoints:list` (distinct
+  from the `daily-resting-heart-rate` type already used) — official,
+  per-sample, ~5s median interval in practice — sliced to the workout's
+  start/end window from `fetch_workouts`, since Fitbit stores that data
+  on-device/cloud-side regardless of BLE range. Not yet implemented in
+  `clients/google_health.py`. **The Whoop half of this is implemented** —
+  `wearable hr-import-whoop` pulls Whoop's own stored series for a workout
+  window at 6 s resolution (see "Per-sample workout HR" above), which covers
+  the underwater stretch BLE missed; Fitbit is the remaining gap.
 - **Fitbit only streams while its "Share Heart Rate" toggle is actively live**
   in the Fitbit/Google Health phone app, and it's a low-rate, contact-gated
   source — roughly 1 sample/2.5 s at rest, sometimes sparser on the wrist

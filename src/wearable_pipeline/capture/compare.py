@@ -151,7 +151,14 @@ def render_chart(session_id: str, aligned: Any, stats: dict, out_path) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    label_map = {"strap": "Chest strap", "whoop": "Whoop", "google_health": "Fitbit Air"}
+    label_map = {
+        "strap": "Chest strap",
+        "whoop": "Whoop",
+        "google_health": "Fitbit Air",
+        # Retrospective pull from Whoop's internal API (`hr-import-whoop`),
+        # distinct from the live BLE `whoop` series.
+        "whoop_api": "Whoop (API)",
+    }
     per_device = stats.get("per_device", {})
     baseline = stats.get("baseline")
     fig, ax = plt.subplots(figsize=(11, 5), dpi=120)
