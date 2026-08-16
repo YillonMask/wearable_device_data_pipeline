@@ -265,6 +265,11 @@ def hr_capture(
 def hr_compare(
     session_id: str = typer.Argument(..., help="Session id (see hr_sessions.id)."),
     out: str | None = typer.Option(None, "--out", help="Chart PNG path."),
+    baseline: str | None = typer.Option(
+        None,
+        "--baseline",
+        help="Device to treat as ground truth (default: strap, else garmin).",
+    ),
 ) -> None:
     """Overlay + agreement stats for a captured HR session (needs `analysis`)."""
     from pathlib import Path
@@ -296,9 +301,20 @@ def hr_compare(
         aligned = align_series(
             samples, max_hold_s=max(8, int(max(gaps) * 2)) if gaps else 8
         )
-        # When a chest strap is in the session, treat it as the ground-truth
-        # baseline: each wearable's agreement is reported against the strap.
-        baseline = "strap" if "strap" in aligned.columns else None
+        # Ground truth is the chest strap. Prefer the live BLE `strap` capture;
+        # fall back to an imported `garmin` series, which is the same physical
+        # strap by a different transport (and the only one that survives a swim).
+        if baseline is None:
+            baseline = next(
+                (d for d in ("strap", "garmin") if d in aligned.columns), None
+            )
+        elif baseline not in aligned.columns:
+            typer.echo(
+                f"Session {session_id} has no device {baseline!r}. Present: "
+                f"{', '.join(aligned.columns)}.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         stats = compute_stats(aligned, rates, baseline=baseline)
     except ImportError:
         typer.echo(
