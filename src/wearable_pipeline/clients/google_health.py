@@ -168,9 +168,10 @@ class GoogleHealthClient:
     def fetch_heart_rate(self, start: datetime, end: datetime) -> HeartRateSeries:
         """Per-sample Fitbit HR covering ``[start, end)`` (tz-aware).
 
-        Fitbit's intraday cadence is roughly one sample per 5 s at rest and can
-        be sparser during motion — nothing like Garmin's true 1 Hz. Measure the
-        delivered spacing rather than assuming a rate.
+        Fitbit's intraday cadence is roughly one sample per 2 s (verified live
+        2026-08-15) — nothing like Garmin's true 1 Hz. Measure the delivered
+        spacing rather than assuming a rate. The Fitbit Air records nothing at
+        all while swimming, so a swim window comes back near-empty.
 
         Paginated responses are archived together under a single ``pages`` key
         so the raw record stays one row per fetch, matching the other clients.

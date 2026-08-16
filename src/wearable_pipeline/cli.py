@@ -780,12 +780,13 @@ def hr_import_fitbit(
 ) -> None:
     """Import per-sample Fitbit HR from Google Health's intraday endpoint.
 
-    Fitbit's cadence is roughly one sample per 5 s at rest and sparser during
-    motion — not the 1 Hz Garmin gives. The delivered spacing is reported.
+    Fitbit's cadence is roughly one sample per 2 s — better than the BLE
+    stream, still short of Garmin's true 1 Hz. Delivered spacing is reported.
 
     Unlike the BLE capture (which only works while the phone's "Share Heart
     Rate" toggle is live and the watch is in range), this reads what Fitbit
-    already stored, so it covers the whole workout.
+    already stored. Note the Fitbit Air records no HR at all while swimming,
+    so a swim window comes back near-empty however it's fetched.
 
     --date     each stored google_health workout that day -> its own session.
     --session  merge into an existing BLE capture as device `fitbit_api`.
