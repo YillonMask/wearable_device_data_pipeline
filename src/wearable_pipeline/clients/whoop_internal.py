@@ -25,13 +25,12 @@ purpose: a break here must never take down the daily metrics pull.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
-from ..models import RawPayload
+from ..models import HeartRateSeries, RawPayload
 
 BASE_URL = "https://api.prod.whoop.com"
 SIGN_IN_ENDPOINT = "/auth-service/v2/whoop/sign-in"
@@ -48,14 +47,6 @@ _API_VERSION = "7"
 
 class WhoopAuthError(RuntimeError):
     """Sign-in with the member's account credentials failed."""
-
-
-@dataclass(frozen=True)
-class HeartRateSeries:
-    """Per-sample HR for one time window, plus the archived raw response."""
-
-    samples: list[tuple[datetime, int]]
-    raw: RawPayload
 
 
 class WhoopInternalClient:

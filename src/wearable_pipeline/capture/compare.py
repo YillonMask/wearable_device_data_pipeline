@@ -158,6 +158,10 @@ def render_chart(session_id: str, aligned: Any, stats: dict, out_path) -> None:
         # Retrospective pull from Whoop's internal API (`hr-import-whoop`),
         # distinct from the live BLE `whoop` series.
         "whoop_api": "Whoop (API)",
+        # Garmin Connect activity samples (`hr-import-garmin`). Often the same
+        # physical chest strap as `strap`, but uploaded rather than streamed —
+        # so it covers stretches where BLE couldn't reach.
+        "garmin": "Garmin (API)",
     }
     per_device = stats.get("per_device", {})
     baseline = stats.get("baseline")

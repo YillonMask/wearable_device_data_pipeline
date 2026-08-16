@@ -42,6 +42,9 @@ uv run wearable backfill --since 2026-05-23      # walk every day from --since t
 uv run wearable backfill --since 2026-05-23 --skip-existing  # idempotent re-run, skip complete days
 uv run wearable analyze --since 2026-05-23       # Spearman rank correlation across device pairs
 uv run wearable hr-import-whoop --date today     # per-sample (6s) Whoop workout HR -> hr_sessions
+uv sync --extra garmin                           # install the Garmin Connect client
+uv run wearable auth garmin                      # one-time SSO login (prompts MFA), caches tokens ~1yr
+uv run wearable hr-import-garmin --session <id>  # merge Garmin activity HR into a BLE session
 
 uv sync --extra viz                              # install Streamlit + pandas/scipy for the UI
 uv run wearable viz                              # launch the Streamlit dashboard at http://localhost:8501
@@ -234,6 +237,19 @@ The spec breaks the build into 6 phases. Phase 1 (scaffold) is done. The expecta
 - **Two entry points.** `--date <D>` imports each stored Whoop workout that day into its own session id `<workout_start>-whoop` (the suffix can never collide with a live BLE session started the same second); it needs the `workouts` table populated, so it depends on OAuth via `wearable pull`. `--session <hr_session_id>` needs no OAuth at all — it takes an existing BLE capture's window and merges Whoop's stored series into that same session under device key **`whoop_api`**, sitting alongside (never overwriting) the live `whoop` BLE series. That's the one to reach for when comparing against the chest-strap baseline or filling an underwater BLE dropout.
 - Re-importing either way is idempotent — `hr_samples`' PK is `(session_id, device, ts_utc)` and the bucket timestamps are deterministic, so `INSERT OR IGNORE` no-ops.
 - `hr-compare` derives its `max_hold_s` from each series' observed median gap (`max(8, 2 × widest gap)`) so a 6 s (or coarser) imported series doesn't step off the end of `align_series`' 8 s default hold and render as an all-NaN column. BLE-only sessions are unaffected.
+
+## Garmin Connect (per-sample workout HR)
+
+Garmin is the **only** source here that returns true per-second HR. Whoop's retrospective floor is a 6 s bucket and Google Health's is ~5 s; Garmin hands back the samples the device actually recorded. Implemented in `clients/garmin.py`, exposed as `wearable hr-import-garmin`.
+
+- **Resolution is a device setting, not an API parameter.** "Every Second" recording gives 1 Hz; Garmin's default "Smart Recording" is variable and much sparser. Always report the delivered spacing (`series_rates`) rather than claiming 1 Hz.
+- **`maxChartSize` silently downsamples.** `GET /activity-service/activity/{id}/details?maxChartSize=N` thins the series above `N` instead of erroring, so a long activity fetched at the 2000 default comes back quietly decimated. `_chart_size()` sizes it from the activity duration (1.25× headroom, capped at 60000). Pass `maxPolylineSize=0` — we don't want the GPS track, and it bloats the archived raw payload.
+- **Detail metrics are positional.** `activityDetailMetrics[].metrics` is a bare array; `metricDescriptors[].metricsIndex` maps position → name (`directHeartRate`, `directTimestamp`), and **the layout varies by device and activity type**. Never hardcode an index — resolve from the descriptors every call. `_descriptor_index` prefers an exact key match, then falls back to a case-insensitive substring.
+- **A hand-entered activity has no HR descriptor at all.** That's a legitimate answer, not an error — `_parse_details` returns `[]` and the CLI says so explicitly rather than failing obscurely.
+- **Auth is Garmin Connect SSO, not OAuth.** `garminconnect>=0.3.10` does its own auth (`curl_cffi` TLS impersonation + rotating user agents) and **no longer depends on the deprecated `garth`** — don't reintroduce garth, its mobile auth flow is broken. Run `wearable auth garmin` once: it prompts for MFA and caches tokens in `GARMINTOKENS` (default `~/.garminconnect`, ~1 year). Later runs need no password, so `hr-import-garmin` stays non-interactive.
+- `garminconnect` requires Python ≥3.12 while this project's floor is 3.11 — the `garmin` extra carries a `python_version >= '3.12'` marker so it doesn't make the project unresolvable on 3.11.
+- **Garmin chest straps (HRM-Pro/HRM-Swim class) store HR internally while submerged** and upload afterwards, so a Garmin strap's Connect data covers underwater stretches that BLE physically cannot reach. When the same strap is also captured live over BLE as `strap`, the two series are the same sensor by different transports — expect near-identical values where both exist, and full coverage only from the API one.
+- Same two entry points as `hr-import-whoop`: `--date` (own session per activity, id `<start>-garmin`) and `--session <id>` (merge into an existing BLE capture as device **`garmin`**, matching the activity by greatest time overlap). Garmin lists by *local* start date, so `--session` widens the query ±1 day to survive a session that straddles local midnight.
 
 ## Oura API gotchas (learned from Phase 2)
 

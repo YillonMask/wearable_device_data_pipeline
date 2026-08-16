@@ -30,6 +30,10 @@ class Settings:
     google_client_secret: str | None
     google_redirect_uri: str | None
     google_refresh_token: str | None
+    # Garmin Connect account login, for per-sample workout HR (clients/garmin.py).
+    garmin_email: str | None
+    garmin_password: str | None
+    garmin_token_dir: str
     whoop_ble_address: str | None
     fitbit_ble_address: str | None
     strap_ble_address: str | None
@@ -56,6 +60,9 @@ def load_settings() -> Settings:
         google_client_secret=_opt("GOOGLE_HEALTH_CLIENT_SECRET"),
         google_redirect_uri=_opt("GOOGLE_HEALTH_REDIRECT_URI"),
         google_refresh_token=_opt("GOOGLE_HEALTH_REFRESH_TOKEN"),
+        garmin_email=_opt("GARMIN_EMAIL"),
+        garmin_password=_opt("GARMIN_PASSWORD"),
+        garmin_token_dir=os.environ.get("GARMINTOKENS", "~/.garminconnect"),
         whoop_ble_address=_opt("WHOOP_BLE_ADDRESS"),
         fitbit_ble_address=_opt("FITBIT_BLE_ADDRESS"),
         strap_ble_address=_opt("STRAP_BLE_ADDRESS"),

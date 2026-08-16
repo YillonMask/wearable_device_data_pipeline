@@ -82,6 +82,20 @@ class Workout(BaseModel):
 
 
 @dataclass(frozen=True)
+class HeartRateSeries:
+    """Per-sample HR for one time window, plus the archived raw response.
+
+    Shared by the retrospective HR clients (`whoop_internal`, `garmin`). The
+    delivered spacing is a property of the source, not of the request — Whoop
+    buckets at 6 s minimum, Garmin returns whatever the device recorded — so
+    callers should measure it from the samples rather than assume.
+    """
+
+    samples: list[tuple[datetime, int]]
+    raw: RawPayload
+
+
+@dataclass(frozen=True)
 class WorkoutFetchResult:
     """What WearableClient.fetch_workouts returns. Storage-agnostic, like FetchResult."""
 

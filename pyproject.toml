@@ -18,6 +18,12 @@ dev = [
 ble = [
     "bleak>=0.22",
 ]
+garmin = [
+    # 0.3.10+ does its own SSO (curl_cffi TLS impersonation); no longer garth.
+    # It requires 3.12+, while the project floor stays 3.11 — the marker keeps
+    # this extra from making the whole project unresolvable on 3.11.
+    "garminconnect>=0.3.10; python_version >= '3.12'",
+]
 analysis = [
     "pandas>=2.2",
     "scipy>=1.13",

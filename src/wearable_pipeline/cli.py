@@ -13,6 +13,7 @@ from .capture.ble_hr import capture_session, scan_hr_peripherals
 # other compare helpers), so it is safe to import without the `analysis` extra.
 from .capture.compare import series_rates
 from .clients._oauth import update_env_var
+from .clients.garmin import GarminAuthError, GarminClient, activity_start_utc
 from .clients.whoop_internal import VALID_STEPS, WhoopInternalClient
 from .config import load_settings
 from .logging_setup import configure_logging
@@ -54,10 +55,11 @@ def init_db() -> None:
 
 @app.command()
 def auth(device: str) -> None:
-    """Run the OAuth flow for a device (whoop | google).
+    """Run the auth flow for a device (whoop | google | garmin).
 
     Oura uses a personal access token — set OURA_PERSONAL_ACCESS_TOKEN in
-    .env directly; no auth command needed.
+    .env directly; no auth command needed. `garmin` is Garmin Connect SSO
+    (not OAuth): it caches tokens on disk and may prompt for an MFA code.
     """
     settings = load_settings()
     if device == "oura":
@@ -99,6 +101,30 @@ def auth(device: str) -> None:
         )
         update_env_var(settings.env_path, "GOOGLE_HEALTH_REFRESH_TOKEN", refresh)
         typer.echo("Google Health refresh token written to .env.")
+        raise typer.Exit(code=0)
+    if device == "garmin":
+        if not settings.garmin_email or not settings.garmin_password:
+            typer.echo(
+                "GARMIN_EMAIL / GARMIN_PASSWORD missing from .env.", err=True
+            )
+            raise typer.Exit(code=2)
+        client = GarminClient(
+            email=settings.garmin_email,
+            password=settings.garmin_password,
+            token_dir=settings.garmin_token_dir,
+        )
+        try:
+            # Any authenticated call forces the SSO handshake; the MFA prompt
+            # (if the account has it on) needs a terminal, which is exactly why
+            # this is a separate command rather than inline in hr-import-garmin.
+            client.list_activities(date.today())
+        except (ImportError, GarminAuthError) as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=2)
+        typer.echo(
+            f"Garmin tokens cached in {settings.garmin_token_dir} (valid ~1 year). "
+            "Later runs need no password."
+        )
         raise typer.Exit(code=0)
     typer.echo(f"auth flow for '{device}' not implemented yet.", err=True)
     raise typer.Exit(code=1)
@@ -739,6 +765,210 @@ def backfill(
         raise typer.Exit(code=2)
 
 
+@app.command("hr-import-garmin")
+def hr_import_garmin(
+    date_str: str | None = typer.Option(
+        None, "--date", help="Local date of the activity: YYYY-MM-DD | today | yesterday."
+    ),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Merge into an existing hr_session, matching the Garmin activity by overlap.",
+    ),
+    activity: str | None = typer.Option(
+        None, "--activity", help="With --date: import only this Garmin activityId."
+    ),
+) -> None:
+    """Import per-sample Garmin activity HR from Garmin Connect.
+
+    Garmin returns the samples the device actually recorded — true 1 s under
+    "Every Second" recording — so unlike Whoop (6 s floor) there's no
+    server-side bucketing. The delivered spacing is reported, not assumed.
+
+    --date     imports each Garmin activity that day into its own session.
+    --session  finds the Garmin activity overlapping an existing BLE capture's
+               window and merges it in as device `garmin`.
+
+    Needs the `garmin` extra (`uv sync --extra garmin`). First run uses
+    GARMIN_EMAIL / GARMIN_PASSWORD from .env and prompts for MFA; after that
+    the cached SSO tokens (~1 year) are enough.
+    """
+    settings = load_settings()
+    if (date_str is None) == (session is None):
+        typer.echo("Pass exactly one of --date or --session.", err=True)
+        raise typer.Exit(code=2)
+
+    configure_logging()
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+    client = GarminClient(
+        email=settings.garmin_email,
+        password=settings.garmin_password,
+        token_dir=settings.garmin_token_dir,
+    )
+
+    try:
+        if session is not None:
+            _garmin_into_session(conn, client, session)
+        else:
+            _garmin_by_date(conn, client, _parse_date(date_str), activity)
+    except ImportError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
+    except GarminAuthError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
+
+
+def _garmin_into_session(conn, client: GarminClient, session_id: str) -> None:
+    try:
+        session, _ = load_hr_session(conn, session_id)
+    except KeyError:
+        typer.echo(f"No session {session_id!r}.", err=True)
+        raise typer.Exit(code=1)
+    if not session["ended_at"]:
+        typer.echo(
+            f"Session {session_id} has no ended_at — can't match an activity.", err=True
+        )
+        raise typer.Exit(code=1)
+
+    start = datetime.fromisoformat(session["started_at"])
+    end = datetime.fromisoformat(session["ended_at"])
+    # Garmin lists by *local* start date; widen by a day either side so a
+    # session spanning local midnight (or a UTC/local offset) still matches.
+    activities = client.list_activities(
+        start.date() - timedelta(days=1), end.date() + timedelta(days=1)
+    )
+    match = _pick_activity_for_window(activities, start, end)
+    if match is None:
+        typer.echo(
+            f"No Garmin activity overlaps {session_id} "
+            f"({start:%Y-%m-%d %H:%M}–{end:%H:%M} UTC).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    series = client.fetch_activity_hr(
+        match["activityId"], duration_s=match.get("duration")
+    )
+    write_raw_payload(
+        conn,
+        device="garmin",
+        endpoint=series.raw.endpoint,
+        date=start.date().isoformat(),
+        payload=series.raw.payload,
+    )
+    name = match.get("activityName") or "activity"
+    if not series.samples:
+        typer.echo(
+            f"Garmin activity {match['activityId']} ({name}) has no heart-rate "
+            "channel — it was likely entered by hand rather than recorded.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    added = _merge_samples_into_session(
+        conn, session_id=session_id, device="garmin", samples=series.samples
+    )
+    if not added:
+        typer.echo(
+            f"Garmin activity {match['activityId']} has samples, but none fall "
+            f"inside {session_id}'s window.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(f"session {session_id} ({session['label'] or 'unlabeled'}):")
+    _print_session_rates(conn, session_id)
+    typer.echo(
+        f"added {added} garmin samples from activity {match['activityId']} "
+        f"({name}). Chart it with `uv run wearable hr-compare {session_id}`."
+    )
+
+
+def _garmin_by_date(
+    conn, client: GarminClient, day: date, activity_id: str | None
+) -> None:
+    activities = client.list_activities(day)
+    if activity_id:
+        activities = [
+            a for a in activities if str(a.get("activityId")) == str(activity_id)
+        ]
+    if not activities:
+        typer.echo(f"No Garmin activities on {day.isoformat()}.", err=True)
+        raise typer.Exit(code=1)
+
+    imported = 0
+    for match in activities:
+        name = match.get("activityName") or "activity"
+        start = activity_start_utc(match)
+        if start is None:
+            typer.echo(f"  {name}: skipped (unparseable startTimeGMT)", err=True)
+            continue
+        series = client.fetch_activity_hr(
+            match["activityId"], duration_s=match.get("duration")
+        )
+        write_raw_payload(
+            conn,
+            device="garmin",
+            endpoint=series.raw.endpoint,
+            date=day.isoformat(),
+            payload=series.raw.payload,
+        )
+        if not series.samples:
+            typer.echo(f"  {name}: no heart-rate channel (hand-entered activity?)")
+            continue
+
+        anchor = min(start, series.samples[0][0])
+        session_id = f"{anchor.strftime('%Y%m%dT%H%M%SZ')}-garmin"
+        if not hr_session_exists(conn, session_id):
+            create_hr_session(
+                conn,
+                session_id=session_id,
+                label=name,
+                started_at=anchor.isoformat(),
+                devices=["garmin"],
+            )
+        added = _merge_samples_into_session(
+            conn, session_id=session_id, device="garmin", samples=series.samples
+        )
+        end_hr_session(
+            conn, session_id=session_id, ended_at=series.samples[-1][0].isoformat()
+        )
+        _, stored = load_hr_session(conn, session_id)
+        rate = series_rates(stored).get("garmin", {})
+        bpms = [s["bpm"] for s in stored]
+        typer.echo(
+            f"  {name} {match['activityId']} -> session {session_id}: "
+            f"n={added} spacing={rate.get('median_gap_s')}s "
+            f"avg={round(sum(bpms) / len(bpms), 1)} max={max(bpms)}"
+        )
+        imported += 1
+
+    if not imported:
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"imported {imported} session(s). Chart one with "
+        "`uv run wearable hr-compare <session_id>`."
+    )
+
+
+def _pick_activity_for_window(
+    activities: list, start: datetime, end: datetime
+) -> dict | None:
+    """The activity overlapping [start, end] the most, if any actually do."""
+    best, best_overlap = None, 0.0
+    for act in activities:
+        act_start = activity_start_utc(act)
+        if act_start is None:
+            continue
+        act_end = act_start + timedelta(seconds=float(act.get("duration") or 0))
+        overlap = (min(end, act_end) - max(start, act_start)).total_seconds()
+        if overlap > best_overlap:
+            best, best_overlap = act, overlap
+    return best
+
+
 def _import_into_session(
     conn, client: WhoopInternalClient, session_id: str, step: int
 ) -> None:
@@ -776,40 +1006,61 @@ def _import_into_session(
         payload=series.raw.payload,
     )
 
-    # This session's anchor is already fixed by the BLE capture, so drop any
-    # bucket predating it rather than emitting a negative t_offset_ms.
-    rows = [
-        (
-            session_id,
-            "whoop_api",
-            ts.isoformat(),
-            int((ts - start).total_seconds() * 1000),
-            bpm,
-        )
-        for ts, bpm in series.samples
-        if ts >= start
-    ]
-    if not rows:
+    added = _merge_samples_into_session(
+        conn, session_id=session_id, device="whoop_api", samples=series.samples
+    )
+    if not added:
         typer.echo(
             f"No samples returned for {session_id} "
             f"({start:%Y-%m-%d %H:%M}–{end:%H:%M} UTC)."
         )
         raise typer.Exit(code=1)
 
-    insert_hr_samples(conn, rows)
-    add_hr_session_device(conn, session_id=session_id, device="whoop_api")
-
-    _, stored = load_hr_session(conn, session_id)
     typer.echo(f"session {session_id} ({session['label'] or 'unlabeled'}):")
+    _print_session_rates(conn, session_id)
+    typer.echo(
+        f"added {added} whoop_api samples. Chart it with "
+        f"`uv run wearable hr-compare {session_id}`."
+    )
+
+
+def _merge_samples_into_session(
+    conn, *, session_id: str, device: str, samples: list
+) -> int:
+    """Insert samples into an existing session, anchored at its ``started_at``.
+
+    That anchor is already fixed by whatever created the session, so samples
+    predating it are dropped rather than emitting a negative t_offset_ms.
+    `hr_samples`' PK is (session_id, device, ts_utc) and source timestamps are
+    deterministic, so INSERT OR IGNORE makes a re-run a no-op.
+    """
+    session, _ = load_hr_session(conn, session_id)
+    start = datetime.fromisoformat(session["started_at"])
+    rows = [
+        (
+            session_id,
+            device,
+            ts.isoformat(),
+            int((ts - start).total_seconds() * 1000),
+            bpm,
+        )
+        for ts, bpm in samples
+        if ts >= start
+    ]
+    if not rows:
+        return 0
+    insert_hr_samples(conn, rows)
+    add_hr_session_device(conn, session_id=session_id, device=device)
+    return len(rows)
+
+
+def _print_session_rates(conn, session_id: str) -> None:
+    _, stored = load_hr_session(conn, session_id)
     for device, rate in series_rates(stored).items():
         typer.echo(
             f"  {device}: n={rate['n']} spacing={rate['median_gap_s']}s "
             f"rate={rate['effective_hz']}Hz"
         )
-    typer.echo(
-        f"added {len(rows)} whoop_api samples. Chart it with "
-        f"`uv run wearable hr-compare {session_id}`."
-    )
 
 
 def _parse_date(value: str) -> date:
