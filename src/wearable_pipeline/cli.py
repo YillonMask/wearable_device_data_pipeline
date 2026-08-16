@@ -14,6 +14,7 @@ from .capture.ble_hr import capture_session, scan_hr_peripherals
 from .capture.compare import series_rates
 from .clients._oauth import update_env_var
 from .clients.garmin import GarminAuthError, GarminClient, activity_start_utc
+from .clients.google_health import GoogleHealthClient
 from .clients.whoop_internal import VALID_STEPS, WhoopInternalClient
 from .config import load_settings
 from .logging_setup import configure_logging
@@ -763,6 +764,163 @@ def backfill(
         raise typer.Exit(code=1)
     if failures > 0:
         raise typer.Exit(code=2)
+
+
+@app.command("hr-import-fitbit")
+def hr_import_fitbit(
+    date_str: str | None = typer.Option(
+        None, "--date", help="Local date of the workout(s): YYYY-MM-DD | today | yesterday."
+    ),
+    session: str | None = typer.Option(
+        None, "--session", help="Merge into an existing hr_session, using its window."
+    ),
+    workout: str | None = typer.Option(
+        None, "--workout", help="With --date: import only this google_health provider_id."
+    ),
+) -> None:
+    """Import per-sample Fitbit HR from Google Health's intraday endpoint.
+
+    Fitbit's cadence is roughly one sample per 5 s at rest and sparser during
+    motion — not the 1 Hz Garmin gives. The delivered spacing is reported.
+
+    Unlike the BLE capture (which only works while the phone's "Share Heart
+    Rate" toggle is live and the watch is in range), this reads what Fitbit
+    already stored, so it covers the whole workout.
+
+    --date     each stored google_health workout that day -> its own session.
+    --session  merge into an existing BLE capture as device `fitbit_api`.
+    """
+    settings = load_settings()
+    if not settings.google_client_id or not settings.google_refresh_token:
+        typer.echo(
+            "GOOGLE_HEALTH_CLIENT_ID / GOOGLE_HEALTH_REFRESH_TOKEN missing from "
+            ".env. Run `wearable auth google` first.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if (date_str is None) == (session is None):
+        typer.echo("Pass exactly one of --date or --session.", err=True)
+        raise typer.Exit(code=2)
+
+    configure_logging()
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+    client = GoogleHealthClient(
+        client_id=settings.google_client_id,
+        client_secret=settings.google_client_secret or "",
+        refresh_token=settings.google_refresh_token,
+        env_path=settings.env_path,
+        local_timezone=settings.local_timezone,
+    )
+
+    if session is not None:
+        _fitbit_into_session(conn, client, session)
+        return
+
+    day = _parse_date(date_str)
+    workouts = load_workouts(conn, device="google_health", day=day.isoformat())
+    if workout:
+        workouts = [w for w in workouts if w["provider_id"] == workout]
+    if not workouts:
+        typer.echo(
+            f"No Fitbit workouts stored for {day.isoformat()}. Run "
+            f"`wearable pull --date {day.isoformat()}` first.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    imported = 0
+    for record in workouts:
+        sport = record["sport"] or "workout"
+        if not record["end_time"]:
+            typer.echo(f"  {sport}: skipped (no end_time)", err=True)
+            continue
+        start = datetime.fromisoformat(record["start_time"])
+        end = datetime.fromisoformat(record["end_time"])
+        series = client.fetch_heart_rate(start, end)
+        write_raw_payload(
+            conn,
+            device="google_health",
+            endpoint=series.raw.endpoint,
+            date=series.raw.date,
+            payload=series.raw.payload,
+        )
+        if not series.samples:
+            typer.echo(f"  {sport} {record['provider_id']}: no samples returned")
+            continue
+
+        anchor = min(start, series.samples[0][0])
+        session_id = f"{anchor.strftime('%Y%m%dT%H%M%SZ')}-fitbit"
+        if not hr_session_exists(conn, session_id):
+            create_hr_session(
+                conn,
+                session_id=session_id,
+                label=sport,
+                started_at=anchor.isoformat(),
+                devices=["fitbit_api"],
+            )
+        added = _merge_samples_into_session(
+            conn, session_id=session_id, device="fitbit_api", samples=series.samples
+        )
+        end_hr_session(conn, session_id=session_id, ended_at=end.isoformat())
+        _, stored = load_hr_session(conn, session_id)
+        rate = series_rates(stored).get("fitbit_api", {})
+        bpms = [s["bpm"] for s in stored]
+        typer.echo(
+            f"  {sport} {record['provider_id']} -> session {session_id}: "
+            f"n={added} spacing={rate.get('median_gap_s')}s "
+            f"avg={round(sum(bpms) / len(bpms), 1)} max={max(bpms)}"
+        )
+        imported += 1
+
+    if not imported:
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"imported {imported} session(s). Chart one with "
+        "`uv run wearable hr-compare <session_id>`."
+    )
+
+
+def _fitbit_into_session(conn, client, session_id: str) -> None:
+    try:
+        session, _ = load_hr_session(conn, session_id)
+    except KeyError:
+        typer.echo(f"No session {session_id!r}.", err=True)
+        raise typer.Exit(code=1)
+    if not session["ended_at"]:
+        typer.echo(
+            f"Session {session_id} has no ended_at — can't bound the fetch.", err=True
+        )
+        raise typer.Exit(code=1)
+
+    start = datetime.fromisoformat(session["started_at"])
+    end = datetime.fromisoformat(session["ended_at"])
+    series = client.fetch_heart_rate(start, end)
+    write_raw_payload(
+        conn,
+        device="google_health",
+        endpoint=series.raw.endpoint,
+        date=series.raw.date,
+        payload=series.raw.payload,
+    )
+
+    added = _merge_samples_into_session(
+        conn, session_id=session_id, device="fitbit_api", samples=series.samples
+    )
+    if not added:
+        typer.echo(
+            f"No Fitbit samples returned for {session_id} "
+            f"({start:%Y-%m-%d %H:%M}–{end:%H:%M} UTC).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(f"session {session_id} ({session['label'] or 'unlabeled'}):")
+    _print_session_rates(conn, session_id)
+    typer.echo(
+        f"added {added} fitbit_api samples. Chart it with "
+        f"`uv run wearable hr-compare {session_id}`."
+    )
 
 
 @app.command("hr-import-garmin")

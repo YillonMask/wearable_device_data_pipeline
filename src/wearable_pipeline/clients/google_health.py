@@ -28,14 +28,21 @@ inside the ``dataSource`` object. ``_is_fitbit_source`` keys off that.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
 
-from ..models import DailyMetrics, FetchResult, RawPayload, Workout, WorkoutFetchResult
+from ..models import (
+    DailyMetrics,
+    FetchResult,
+    HeartRateSeries,
+    RawPayload,
+    Workout,
+    WorkoutFetchResult,
+)
 from ._oauth import TokenManager
 
 BASE_URL = "https://health.googleapis.com/v4/"
@@ -55,7 +62,23 @@ ROLLUP_TYPES = (TYPE_STEPS, TYPE_ACTIVE_ENERGY)
 
 TYPE_WORKOUT = "exercise"
 
+# Per-sample intraday HR. `HeartRate` is a *sample* data type in the v4 schema
+# (`sampleTime` + `beatsPerMinute`), not an interval or daily-summary one.
+TYPE_HEART_RATE = "heart-rate"
+
+# Server-side time filtering DOES work on dataPoints:list — but the field family
+# has to match the data type's shape, and the field name is snake_case even
+# though the data type id is hyphenated (`heart-rate` -> `heart_rate`). Sample
+# types filter on `sample_time.physical_time`; interval types on
+# `interval.start_time`; daily summaries on `date`. Using the wrong family is
+# what returns INVALID_DATA_POINT_FILTER_DATA_TYPE_RESTRICTION.
+_HR_FILTER_FIELD = "heart_rate.sample_time.physical_time"
+
 _DEFAULT_PAGE_SIZE = 100
+# dataPoints:list caps pageSize at 10000 (except exercise/sleep, capped at 25).
+# Intraday HR is dense, so ask for the max rather than the 100 used elsewhere.
+_MAX_PAGE_SIZE = 10000
+_MAX_PAGES = 50  # guard against an unbounded nextPageToken loop
 
 
 class GoogleHealthClient:
@@ -141,6 +164,57 @@ class GoogleHealthClient:
             if w is not None:
                 workouts.append(w)
         return WorkoutFetchResult(workouts=workouts, raw=raw)
+
+    def fetch_heart_rate(self, start: datetime, end: datetime) -> HeartRateSeries:
+        """Per-sample Fitbit HR covering ``[start, end)`` (tz-aware).
+
+        Fitbit's intraday cadence is roughly one sample per 5 s at rest and can
+        be sparser during motion — nothing like Garmin's true 1 Hz. Measure the
+        delivered spacing rather than assuming a rate.
+
+        Paginated responses are archived together under a single ``pages`` key
+        so the raw record stays one row per fetch, matching the other clients.
+        """
+        samples: list[tuple[datetime, int]] = []
+        pages: list[dict[str, Any]] = []
+        time_filter = (
+            f'{_HR_FILTER_FIELD} >= "{_rfc3339(start)}" AND '
+            f'{_HR_FILTER_FIELD} < "{_rfc3339(end)}"'
+        )
+
+        client, owned = self._open_client()
+        try:
+            page_token: str | None = None
+            for _ in range(_MAX_PAGES):
+                params: dict[str, Any] = {
+                    "pageSize": _MAX_PAGE_SIZE,
+                    "filter": time_filter,
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                body = self._authed_request(
+                    client, "GET", _list_path(TYPE_HEART_RATE), params=params
+                )
+                pages.append(body)
+                for dp in body.get("dataPoints") or []:
+                    sample = _normalize_hr_sample(dp)
+                    if sample is not None:
+                        samples.append(sample)
+                page_token = body.get("nextPageToken")
+                if not page_token:
+                    break
+        finally:
+            if owned:
+                client.close()
+
+        # The API returns newest-first; downstream wants chronological order.
+        samples.sort(key=lambda pair: pair[0])
+        raw = RawPayload(
+            endpoint=_list_path(TYPE_HEART_RATE),
+            date=start.date().isoformat(),
+            payload={"pages": pages},
+        )
+        return HeartRateSeries(samples=samples, raw=raw)
 
     def _normalize_workout(self, dp: dict[str, Any], since: date, until: date) -> Workout | None:
         if not _is_fitbit_source(dp.get("dataSource")):
@@ -314,6 +388,33 @@ def _date_proto_matches(date_proto: dict[str, Any] | None, day: date) -> bool:
         and date_proto.get("month") == day.month
         and date_proto.get("day") == day.day
     )
+
+
+def _rfc3339(dt: datetime) -> str:
+    """Filter literals must be RFC-3339 with an explicit Z."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_hr_sample(dp: dict[str, Any]) -> tuple[datetime, int] | None:
+    """One `heart-rate` data point -> (utc_datetime, bpm), or None to skip.
+
+    Source-filtered to Fitbit: the same Google Health account can carry samples
+    from a Pixel Watch or a phone, and mixing those into a Fitbit series would
+    silently corrupt the comparison.
+    """
+    if not _is_fitbit_source(dp.get("dataSource")):
+        return None
+    hr = dp.get("heartRate") or {}
+    # beatsPerMinute is a *string* in the v4 schema, like most numerics here.
+    bpm = _to_float(hr.get("beatsPerMinute"))
+    physical = (hr.get("sampleTime") or {}).get("physicalTime")
+    if bpm is None or bpm <= 0 or not isinstance(physical, str):
+        return None
+    try:
+        ts = datetime.fromisoformat(physical.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ts.astimezone(timezone.utc), round(bpm)
 
 
 def _is_fitbit_source(data_source: dict[str, Any] | None) -> bool:

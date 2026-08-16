@@ -45,6 +45,7 @@ uv run wearable hr-import-whoop --date today     # per-sample (6s) Whoop workout
 uv sync --extra garmin                           # install the Garmin Connect client
 uv run wearable auth garmin                      # one-time SSO login (prompts MFA), caches tokens ~1yr
 uv run wearable hr-import-garmin --session <id>  # merge Garmin activity HR into a BLE session
+uv run wearable hr-import-fitbit --session <id>  # merge Fitbit intraday (~5s) HR into a BLE session
 
 uv sync --extra viz                              # install Streamlit + pandas/scipy for the UI
 uv run wearable viz                              # launch the Streamlit dashboard at http://localhost:8501
@@ -199,11 +200,19 @@ The spec breaks the build into 6 phases. Phase 1 (scaffold) is done. The expecta
 - **Scopes confirmed via the v4 discovery doc** (`https://health.googleapis.com/$discovery/rest?version=v4`): `googlehealth.activity_and_fitness.readonly`, `googlehealth.health_metrics_and_measurements.readonly`, `googlehealth.sleep.readonly`. Refresh the discovery doc to update — `auth/google_flow.py:DEFAULT_SCOPES`.
 - **OAuth prompts**: `access_type=offline` + `prompt=select_account consent` in the authorize URL. `offline` guarantees a refresh token; `select_account` forces the account picker so you can switch accounts during re-auth; `consent` re-shows the scope screen so a refresh token is reliably issued every time.
 - **Prerequisite — the user's Google account must be linked to Google Health.** The Fitbit app on phone must be signed into the same Google account they consent with, and the Fitbit→Google Health sync must be set up at https://fitbit.google.com/auth/signup. If not, every endpoint returns 400 with `reason: ACCOUNT_NOT_LINKED`.
-- **Don't pass a `filter` query param on `dataPoints` list endpoints.** Google's AIP-160 implementation rejects every date/time syntax we tried (`INVALID_DATA_POINT_FILTER_DATA_TYPE_RESTRICTION`, `INVALID_DATA_POINT_FILTER_RESTRICTION_COMPARABLE`). Fetch a page unfiltered and filter client-side by the response's nested `date: {year, month, day}` proto.
+- **`filter` on `dataPoints:list` DOES work — but the field family must match the data type's shape.** (Corrected 2026-08-15 from the v4 discovery doc; the earlier "filters always fail" note was almost certainly the wrong field family, which is exactly what `INVALID_DATA_POINT_FILTER_DATA_TYPE_RESTRICTION` means.) Two rules: the field name is **snake_case** even though the data type id is hyphenated (`heart-rate` → `heart_rate`), and the family depends on the shape:
+  - sample types (`heart-rate`): `heart_rate.sample_time.physical_time >= "2026-08-11T04:10:00Z"` (RFC-3339, or `.sample_time.civil_time` for ISO-8601 local)
+  - interval types (`steps`): `steps.interval.start_time` / `.interval.civil_start_time`
+  - daily summaries (`daily-heart-rate-variability`): `daily_heart_rate_variability.date >= "2026-08-11"`
+  - sessions: `exercise.interval.civil_start_time`; sleep is special-cased to `sleep.interval.end_time` (and supports `OR`)
+
+  Only `>=` and `<` are supported, joined by `AND`. Results come back **descending** by interval start — sort client-side. `fetch_day`'s existing unfiltered-then-filter-client-side approach still works and is left alone; `fetch_heart_rate` uses the filter because an unfiltered intraday pull would be thousands of points.
+- **`pageSize` maxes at 10000**, not the 100 `_DEFAULT_PAGE_SIZE` uses (default is 1440 if unset). The exception is `exercise` and `sleep`, both capped at **25**. Intraday HR is dense — ask for the max there.
 - **`dataPoints:dailyRollUp` POST body shape**: `range` uses fields `start` and `end` (NOT `startTime`/`endTime`), each a `CivilDateTime` proto = `{date: {year, month, day}}` (NOT a flat `{year, month, day}`). Wrong shape → `Cannot find field` 400.
 - **Rollup value keys are different from per-sample keys.** `Steps` per-sample has `count`; `StepsRollupValue` has `countSum`. `ActiveEnergyBurned` per-sample has `kcal`; `ActiveEnergyBurnedRollupValue` has `kcalSum`. Don't conflate the two.
 - **Source filter**: real responses tag Fitbit data with `dataSource: {platform: "FITBIT"}`. `applicationDataSourceId` and other historical fields are empty. `_is_fitbit_source` keys off `platform == "FITBIT"`.
 - **`dataPoints:reconcile` is the merged-source stream** — explicitly never call it. Use `:list` and filter `dataSource` client-side.
+- **Per-sample intraday HR is the `heart-rate` sample data type** (distinct from `daily-resting-heart-rate`), implemented as `GoogleHealthClient.fetch_heart_rate(start, end)` and exposed as `wearable hr-import-fitbit`. Shape per the v4 discovery doc: `dataPoints[].heartRate.beatsPerMinute` (a **string**, like the other numerics) and `dataPoints[].heartRate.sampleTime.physicalTime` (RFC-3339). Source-filter to Fitbit as always — a Pixel Watch on the same account would otherwise contaminate the series. Cadence is ~5 s at rest and sparser in motion; nowhere near Garmin's 1 Hz, so report delivered spacing. Lands as device **`fitbit_api`**, beside the live BLE `google_health` series.
 - **No Fitbit "Readiness" or "Sleep Score" in the v4 public API.** Confirmed empirically on 2026-06-22: searched every schema and property in the discovery doc — zero fields with `readiness`/`score` in their name. Probed 30+ candidate data type IDs (`daily-readiness`, `daily-readiness-score`, `fitbit-readiness`, `wellness-score`, `recovery-score`, etc.) — every one returns 400 "Invalid data type ID". The Google Health mobile app does display readiness (e.g. "48"), but it either uses an internal Google API not exposed to third-party OAuth clients, or computes the score client-side from raw inputs. Don't waste another session re-probing — `google_health.readiness_score` and `google_health.sleep_score` are permanently `None`. Same for `body_temp_deviation` and `skin_temp`.
 - **`minutes` values come back as strings**, not ints — convert via `_int_or_none`. Same for `count`/`countSum`.
 - **Per-session Fitbit workouts use the `exercise` data type** (NOT `activity`, `workout`, `session`, or any variant — those all return 400 "Invalid data type ID"). `fetch_workouts(since, until)` calls `GET dataTypes/exercise/dataPoints` with `pageSize=100` and filters client-side to Fitbit-source records whose start local-date falls within `[since, until]`. `provider_id` is the last path segment of the response `name` field (`name.split("/")[-1]`). `averageHeartRateBeatsPerMinute` in `metricsSummary` is a **string**, not a number — convert via `_to_float`. Calories are at `metricsSummary.caloriesKcal`. **Per-session max HR is not exposed** in the v4 API (only average HR and `heartRateZoneDurations` appear in `metricsSummary`), so `google_health` workouts always have `max_hr=None`.
@@ -304,11 +313,14 @@ since it talks to devices directly over Bluetooth rather than a vendor API.
   from the `daily-resting-heart-rate` type already used) — official,
   per-sample, ~5s median interval in practice — sliced to the workout's
   start/end window from `fetch_workouts`, since Fitbit stores that data
-  on-device/cloud-side regardless of BLE range. Not yet implemented in
-  `clients/google_health.py`. **The Whoop half of this is implemented** —
-  `wearable hr-import-whoop` pulls Whoop's own stored series for a workout
-  window at 6 s resolution (see "Per-sample workout HR" above), which covers
-  the underwater stretch BLE missed; Fitbit is the remaining gap.
+  on-device/cloud-side regardless of BLE range. **This is now implemented for
+  all three** — `hr-import-whoop` (6 s), `hr-import-garmin` (true 1 s) and
+  `hr-import-fitbit` (~5 s) each pull the device's own stored series for a
+  window and merge it into the BLE session, covering the underwater stretch
+  BLE physically could not. Garmin is the one to trust for swim HR: verified
+  2026-08-15 on the Aug 10 swim at 1734 samples / 1.0 s over the full 28.9 min,
+  agreeing with the BLE chest strap to |Δ|=1.78 bpm (r=0.91) where they
+  overlap — same sensor, different transport.
 - **Fitbit only streams while its "Share Heart Rate" toggle is actively live**
   in the Fitbit/Google Health phone app, and it's a low-rate, contact-gated
   source — roughly 1 sample/2.5 s at rest, sometimes sparser on the wrist

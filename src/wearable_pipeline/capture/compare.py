@@ -162,6 +162,9 @@ def render_chart(session_id: str, aligned: Any, stats: dict, out_path) -> None:
         # physical chest strap as `strap`, but uploaded rather than streamed —
         # so it covers stretches where BLE couldn't reach.
         "garmin": "Garmin (API)",
+        # Fitbit intraday pull (`hr-import-fitbit`), as opposed to the live BLE
+        # `google_health` series which only streams while the phone toggle is on.
+        "fitbit_api": "Fitbit (API)",
     }
     per_device = stats.get("per_device", {})
     baseline = stats.get("baseline")
