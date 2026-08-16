@@ -510,7 +510,10 @@ def hr_import_whoop(
 
         _, stored = load_hr_session(conn, session_id)
         rate = series_rates(stored).get("whoop", {})
-        bpms = [s["bpm"] for s in stored]
+        # `stored` holds every device in the session, so filter to the series we
+        # just imported — otherwise a re-run into a session that already has
+        # other devices reports their averages mixed in.
+        bpms = [s["bpm"] for s in stored if s["device"] == "whoop"]
         typer.echo(
             f"  {sport} {provider_id} -> session {session_id}: "
             f"n={len(stored)} spacing={rate.get('median_gap_s')}s "
@@ -794,6 +797,121 @@ def backfill(
         raise typer.Exit(code=2)
 
 
+@app.command("hr-swim")
+def hr_swim(
+    date_str: str = typer.Option(
+        ..., "--date", help="Local date of the swim: YYYY-MM-DD | today | yesterday."
+    ),
+    activity: str | None = typer.Option(
+        None, "--activity", help="Only this Garmin activityId."
+    ),
+) -> None:
+    """Build an API-only HR session for a swim: Garmin + Whoop + Fitbit, no BLE.
+
+    BLE cannot reach a submerged strap — measured coverage across past swims is
+    6–9% of the session — so swims skip `hr-capture` entirely. This anchors the
+    session on the Garmin activity (the only source with full underwater
+    coverage) and merges the Whoop and Fitbit series into it.
+
+    Partial-failure tolerant: a source that's unconfigured or errors is reported
+    and skipped, so one bad credential doesn't cost you the whole swim.
+    """
+    settings = load_settings()
+    configure_logging()
+    day = _parse_date(date_str)
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+
+    garmin = GarminClient(
+        email=settings.garmin_email,
+        password=settings.garmin_password,
+        token_dir=settings.garmin_token_dir,
+    )
+    try:
+        session_ids = _garmin_by_date(conn, garmin, day, activity)
+    except (ImportError, GarminAuthError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2)
+
+    whoop = None
+    if settings.whoop_username and settings.whoop_password:
+        whoop = WhoopInternalClient(
+            username=settings.whoop_username, password=settings.whoop_password
+        )
+    fitbit = None
+    if settings.google_client_id and settings.google_refresh_token:
+        fitbit = GoogleHealthClient(
+            client_id=settings.google_client_id,
+            client_secret=settings.google_client_secret or "",
+            refresh_token=settings.google_refresh_token,
+            env_path=settings.env_path,
+            local_timezone=settings.local_timezone,
+        )
+
+    for session_id in session_ids:
+        session, _ = load_hr_session(conn, session_id)
+        start = datetime.fromisoformat(session["started_at"])
+        end = datetime.fromisoformat(session["ended_at"] or session["started_at"])
+        typer.echo(f"session {session_id} ({session['label'] or 'unlabeled'}):")
+
+        if whoop is None:
+            typer.echo("  whoop: SKIP (WHOOP_USERNAME / WHOOP_PASSWORD not set)")
+        else:
+            _merge_api_source(
+                conn,
+                session_id=session_id,
+                label="whoop",
+                device="whoop_api",
+                raw_device="whoop",
+                fetch=lambda: whoop.fetch_heart_rate(start, end),
+            )
+        if fitbit is None:
+            typer.echo("  fitbit: SKIP (run `wearable auth google` first)")
+        else:
+            _merge_api_source(
+                conn,
+                session_id=session_id,
+                label="fitbit",
+                device="fitbit_api",
+                raw_device="google_health",
+                fetch=lambda: fitbit.fetch_heart_rate(start, end),
+            )
+        _print_session_rates(conn, session_id)
+        typer.echo(
+            f"  chart: `uv run wearable hr-compare {session_id}` "
+            "(baseline falls back to garmin)"
+        )
+
+
+def _merge_api_source(
+    conn, *, session_id: str, label: str, device: str, raw_device: str, fetch
+) -> None:
+    """Fetch one API source into a session, tolerating that source failing.
+
+    Raw is archived even on an empty result — an empty window is itself
+    evidence (e.g. Fitbit records nothing while swimming).
+    """
+    try:
+        series = fetch()
+    except Exception as exc:
+        typer.echo(f"  {label}: FAIL {type(exc).__name__}: {exc}", err=True)
+        return
+    write_raw_payload(
+        conn,
+        device=raw_device,
+        endpoint=series.raw.endpoint,
+        date=series.raw.date,
+        payload=series.raw.payload,
+    )
+    added = _merge_samples_into_session(
+        conn, session_id=session_id, device=device, samples=series.samples
+    )
+    if added:
+        typer.echo(f"  {label}: +{added} samples")
+    else:
+        typer.echo(f"  {label}: no samples in this window")
+
+
 @app.command("hr-import-fitbit")
 def hr_import_fitbit(
     date_str: str | None = typer.Option(
@@ -894,7 +1012,7 @@ def hr_import_fitbit(
         end_hr_session(conn, session_id=session_id, ended_at=end.isoformat())
         _, stored = load_hr_session(conn, session_id)
         rate = series_rates(stored).get("fitbit_api", {})
-        bpms = [s["bpm"] for s in stored]
+        bpms = [s["bpm"] for s in stored if s["device"] == "fitbit_api"]
         typer.echo(
             f"  {sport} {record['provider_id']} -> session {session_id}: "
             f"n={added} spacing={rate.get('median_gap_s')}s "
@@ -998,7 +1116,11 @@ def hr_import_garmin(
         if session is not None:
             _garmin_into_session(conn, client, session)
         else:
-            _garmin_by_date(conn, client, _parse_date(date_str), activity)
+            created = _garmin_by_date(conn, client, _parse_date(date_str), activity)
+            typer.echo(
+                f"imported {len(created)} session(s). Chart one with "
+                "`uv run wearable hr-compare <session_id>`."
+            )
     except ImportError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2)
@@ -1075,7 +1197,7 @@ def _garmin_into_session(conn, client: GarminClient, session_id: str) -> None:
 
 def _garmin_by_date(
     conn, client: GarminClient, day: date, activity_id: str | None
-) -> None:
+) -> list[str]:
     activities = client.list_activities(day)
     if activity_id:
         activities = [
@@ -1085,7 +1207,7 @@ def _garmin_by_date(
         typer.echo(f"No Garmin activities on {day.isoformat()}.", err=True)
         raise typer.Exit(code=1)
 
-    imported = 0
+    session_ids: list[str] = []
     for match in activities:
         name = match.get("activityName") or "activity"
         start = activity_start_utc(match)
@@ -1124,20 +1246,17 @@ def _garmin_by_date(
         )
         _, stored = load_hr_session(conn, session_id)
         rate = series_rates(stored).get("garmin", {})
-        bpms = [s["bpm"] for s in stored]
+        bpms = [s["bpm"] for s in stored if s["device"] == "garmin"]
         typer.echo(
             f"  {name} {match['activityId']} -> session {session_id}: "
             f"n={added} spacing={rate.get('median_gap_s')}s "
             f"avg={round(sum(bpms) / len(bpms), 1)} max={max(bpms)}"
         )
-        imported += 1
+        session_ids.append(session_id)
 
-    if not imported:
+    if not session_ids:
         raise typer.Exit(code=1)
-    typer.echo(
-        f"imported {imported} session(s). Chart one with "
-        "`uv run wearable hr-compare <session_id>`."
-    )
+    return session_ids
 
 
 def _pick_activity_for_window(

@@ -45,7 +45,8 @@ uv run wearable hr-import-whoop --date today     # per-sample (6s) Whoop workout
 uv sync --extra garmin                           # install the Garmin Connect client
 uv run wearable auth garmin                      # one-time SSO login (prompts MFA), caches tokens ~1yr
 uv run wearable hr-import-garmin --session <id>  # merge Garmin activity HR into a BLE session
-uv run wearable hr-import-fitbit --session <id>  # merge Fitbit intraday (~5s) HR into a BLE session
+uv run wearable hr-import-fitbit --session <id>  # merge Fitbit intraday (~2s) HR into a BLE session
+uv run wearable hr-swim --date 2026-08-07        # SWIMS: one-shot API-only session (Garmin+Whoop+Fitbit)
 
 uv sync --extra viz                              # install Streamlit + pandas/scipy for the UI
 uv run wearable viz                              # launch the Streamlit dashboard at http://localhost:8501
@@ -325,6 +326,16 @@ since it talks to devices directly over Bluetooth rather than a vendor API.
   2026-08-15 on the Aug 10 swim at 1734 samples / 1.0 s over the full 28.9 min,
   agreeing with the BLE chest strap to |Δ|=1.78 bpm (r=0.91) where they
   overlap — same sensor, different transport.
+- **Swim sessions: skip BLE entirely, use the API imports.** Measured across
+  every swim captured so far, BLE dies within the first ~2.5 min and covers
+  only 6–9% of the session (Aug 10: last sample at 148 s of 1730 s; Aug 12:
+  106 s of 1738 s). Water absorbs 2.4 GHz far too fast for a submerged strap to
+  reach the laptop, and the reconnect logic only recovers surface moments (wall
+  touches, flip turns). Do NOT run `hr-capture` for a swim — use `wearable
+  hr-swim --date <D>`, which builds the session from the Garmin activity (the
+  only source with full underwater coverage) and merges the Whoop and Fitbit
+  API series into it. BLE capture stays the right tool for **land** workouts,
+  where it gives 1–2 Hz against the API's 1–6 s.
 - **Fitbit only streams while its "Share Heart Rate" toggle is actively live**
   in the Fitbit/Google Health phone app, and it's a low-rate, contact-gated
   source — roughly 1 sample/2.5 s at rest, sometimes sparser on the wrist
