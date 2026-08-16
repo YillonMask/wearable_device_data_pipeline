@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -10,6 +10,7 @@ import respx
 from wearable_pipeline.clients.google_health import (
     BASE_URL,
     TYPE_HEART_RATE,
+    TYPE_WORKOUT,
     GoogleHealthClient,
     _list_path,
     _normalize_hr_sample,
@@ -158,6 +159,96 @@ def test_fetch_heart_rate_sorts_newest_first_responses(env_file) -> None:
 
     assert [bpm for _, bpm in series.samples] == [120, 122, 125]
     assert series.samples[0][0] < series.samples[-1][0]
+
+
+# --- fetch_workouts paging / filtering ---------------------------------------
+
+WORKOUT_URL = f"{BASE_URL}{_list_path(TYPE_WORKOUT)}"
+
+
+def _exercise_point(idx: int, day: str = "2026-06-26") -> dict:
+    return {
+        "name": f"users/me/dataTypes/exercise/dataPoints/{idx}",
+        "dataSource": {"platform": "FITBIT"},
+        "exercise": {
+            "interval": {
+                "startTime": f"{day}T17:00:0{idx % 10}Z",
+                "endTime": f"{day}T17:30:00Z",
+            },
+            "exerciseType": "WORKOUT",
+            "displayName": f"w{idx}",
+            "metricsSummary": {},
+        },
+    }
+
+
+@respx.mock
+def test_fetch_workouts_uses_civil_filter_and_the_25_cap(env_file) -> None:
+    """exercise caps at 25/page; asking for more is silently truncated."""
+    _mock_token()
+    route = respx.get(WORKOUT_URL).mock(
+        return_value=httpx.Response(200, json={"dataPoints": []})
+    )
+
+    _make_client(env_file).fetch_workouts(date(2026, 6, 20), date(2026, 6, 26))
+
+    params = dict(route.calls[0].request.url.params)
+    assert params["pageSize"] == "25"
+    # Session type -> civil_start_time; upper bound exclusive, so until + 1 day
+    assert params["filter"] == (
+        'exercise.interval.civil_start_time >= "2026-06-20" AND '
+        'exercise.interval.civil_start_time < "2026-06-27"'
+    )
+
+
+@respx.mock
+def test_fetch_workouts_paginates_past_the_first_25(env_file) -> None:
+    """Without paging a backfill would silently stop at 25 workouts."""
+    _mock_token()
+    page1 = {
+        "dataPoints": [_exercise_point(i) for i in range(25)],
+        "nextPageToken": "p2",
+    }
+    page2 = {"dataPoints": [_exercise_point(i) for i in range(25, 30)]}
+    respx.get(WORKOUT_URL).mock(
+        side_effect=[httpx.Response(200, json=page1), httpx.Response(200, json=page2)]
+    )
+
+    result = _make_client(env_file).fetch_workouts(date(2026, 6, 26), date(2026, 6, 26))
+
+    assert len(result.workouts) == 30
+    assert len(result.raw) == 2  # one archived row per page
+
+
+@respx.mock
+def test_fetch_workouts_sends_page_token_on_later_pages(env_file) -> None:
+    _mock_token()
+    route = respx.get(WORKOUT_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={"dataPoints": [], "nextPageToken": "p2"}),
+            httpx.Response(200, json={"dataPoints": []}),
+        ]
+    )
+
+    _make_client(env_file).fetch_workouts(date(2026, 6, 26), date(2026, 6, 26))
+
+    assert "pageToken" not in dict(route.calls[0].request.url.params)
+    assert dict(route.calls[1].request.url.params)["pageToken"] == "p2"
+
+
+@respx.mock
+def test_fetch_workouts_stops_at_max_pages(env_file) -> None:
+    """A server that always returns a token must not loop forever."""
+    _mock_token()
+    route = respx.get(WORKOUT_URL).mock(
+        return_value=httpx.Response(
+            200, json={"dataPoints": [], "nextPageToken": "always"}
+        )
+    )
+
+    _make_client(env_file).fetch_workouts(date(2026, 6, 26), date(2026, 6, 26))
+
+    assert route.call_count == 50
 
 
 @respx.mock

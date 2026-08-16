@@ -73,11 +73,16 @@ TYPE_HEART_RATE = "heart-rate"
 # `interval.start_time`; daily summaries on `date`. Using the wrong family is
 # what returns INVALID_DATA_POINT_FILTER_DATA_TYPE_RESTRICTION.
 _HR_FILTER_FIELD = "heart_rate.sample_time.physical_time"
+# `exercise` is a *session* type, so it filters on civil (local) start time.
+_WORKOUT_FILTER_FIELD = "exercise.interval.civil_start_time"
 
 _DEFAULT_PAGE_SIZE = 100
 # dataPoints:list caps pageSize at 10000 (except exercise/sleep, capped at 25).
 # Intraday HR is dense, so ask for the max rather than the 100 used elsewhere.
 _MAX_PAGE_SIZE = 10000
+# ...except `exercise` and `sleep`, which Google caps at 25 per page. Asking for
+# more is silently truncated, so a wide window MUST paginate.
+_EXERCISE_PAGE_SIZE = 25
 _MAX_PAGES = 50  # guard against an unbounded nextPageToken loop
 
 
@@ -141,25 +146,58 @@ class GoogleHealthClient:
         return FetchResult(metrics=metrics, raw=raw)
 
     def fetch_workouts(self, since: date, until: date) -> WorkoutFetchResult:
+        """Fitbit workouts whose local start date falls in ``[since, until]``.
+
+        Three things have to line up here or workouts go missing *silently*:
+
+        * `exercise` is capped at **25** per page (not the 10000 other types
+          allow), so anything wider than a couple of days needs pagination.
+        * Results come back newest-first, so without a server-side filter a
+          backfill of an older range would just get the 25 most recent
+          workouts and match none of them.
+        * Sessions filter on **civil** (local) start time, and the upper bound
+          is exclusive — hence `until + 1 day` to keep `until` inclusive for
+          the caller.
+        """
+        time_filter = (
+            f'{_WORKOUT_FILTER_FIELD} >= "{since.isoformat()}" AND '
+            f'{_WORKOUT_FILTER_FIELD} < "{(until + timedelta(days=1)).isoformat()}"'
+        )
         raw: list[RawPayload] = []
+        data_points: list[dict[str, Any]] = []
+
         client, owned = self._open_client()
         try:
-            body = self._authed_request(
-                client, "GET", _list_path(TYPE_WORKOUT),
-                params={"pageSize": _DEFAULT_PAGE_SIZE},
-            )
+            page_token: str | None = None
+            for _ in range(_MAX_PAGES):
+                params: dict[str, Any] = {
+                    "pageSize": _EXERCISE_PAGE_SIZE,
+                    "filter": time_filter,
+                }
+                if page_token:
+                    params["pageToken"] = page_token
+                body = self._authed_request(
+                    client, "GET", _list_path(TYPE_WORKOUT), params=params
+                )
+                # One raw row per page — WorkoutFetchResult.raw is already a
+                # list, so nothing needs to change downstream.
+                raw.append(
+                    RawPayload(
+                        endpoint=_list_path(TYPE_WORKOUT),
+                        date=f"{since.isoformat()}..{until.isoformat()}",
+                        payload=body,
+                    )
+                )
+                data_points.extend(body.get("dataPoints") or [])
+                page_token = body.get("nextPageToken")
+                if not page_token:
+                    break
         finally:
             if owned:
                 client.close()
-        raw.append(
-            RawPayload(
-                endpoint=_list_path(TYPE_WORKOUT),
-                date=f"{since.isoformat()}..{until.isoformat()}",
-                payload=body,
-            )
-        )
+
         workouts = []
-        for dp in body.get("dataPoints") or []:
+        for dp in data_points:
             w = self._normalize_workout(dp, since, until)
             if w is not None:
                 workouts.append(w)
