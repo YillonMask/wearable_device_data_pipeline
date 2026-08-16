@@ -4,6 +4,20 @@ import statistics
 from typing import Any
 
 
+# `strap` (live BLE stream) and `garmin` (Garmin Connect import) are the SAME
+# physical chest strap reaching us by two different transports — in this setup
+# STRAP_BLE_ADDRESS is the Garmin HRM. Their agreement is a check on the import
+# pipeline's parsing and time-alignment, NOT a cross-device accuracy comparison.
+# Presenting it as one double-counts a single sensor. (If STRAP_BLE_ADDRESS ever
+# points at a non-Garmin strap, drop this pairing.)
+SAME_SENSOR_PAIRS: tuple[frozenset[str], ...] = (frozenset({"strap", "garmin"}),)
+
+
+def is_same_sensor(a: str, b: str) -> bool:
+    """True if two device keys are one physical sensor via different transports."""
+    return frozenset({a, b}) in SAME_SENSOR_PAIRS
+
+
 def series_rates(samples: list[dict]) -> dict:
     """Per-device sampling density: {device: {n, effective_hz, median_gap_s}}."""
     rates: dict[str, dict] = {}
@@ -152,16 +166,17 @@ def render_chart(session_id: str, aligned: Any, stats: dict, out_path) -> None:
     import matplotlib.pyplot as plt
 
     label_map = {
-        "strap": "Chest strap",
+        # Labelled to make the shared sensor obvious: `strap` and `garmin` are
+        # one chest strap by two transports (see SAME_SENSOR_PAIRS).
+        "strap": "Garmin strap (BLE)",
         "whoop": "Whoop",
         "google_health": "Fitbit Air",
         # Retrospective pull from Whoop's internal API (`hr-import-whoop`),
         # distinct from the live BLE `whoop` series.
         "whoop_api": "Whoop (API)",
-        # Garmin Connect activity samples (`hr-import-garmin`). Often the same
-        # physical chest strap as `strap`, but uploaded rather than streamed —
-        # so it covers stretches where BLE couldn't reach.
-        "garmin": "Garmin (API)",
+        # Garmin Connect activity samples (`hr-import-garmin`) — the strap's own
+        # recording, which covers stretches BLE couldn't reach.
+        "garmin": "Garmin strap (API)",
         # Fitbit intraday pull (`hr-import-fitbit`), as opposed to the live BLE
         # `google_health` series which only streams while the phone toggle is on.
         "fitbit_api": "Fitbit (API)",
@@ -197,8 +212,13 @@ def render_chart(session_id: str, aligned: Any, stats: dict, out_path) -> None:
     if stats.get("pairs"):
         base_name = label_map.get(baseline, baseline)
         segs = [
-            f"{label_map.get(device, device)}: |Δ|={p.get('mean_abs_diff')} "
-            f"±5={p.get('pct_within_5')}% r={p.get('pearson_r')} n={p['n_overlap']}"
+            (
+                f"{label_map.get(device, device)}: same sensor, |Δ|={p.get('mean_abs_diff')}"
+                if is_same_sensor(device, baseline)
+                else
+                f"{label_map.get(device, device)}: |Δ|={p.get('mean_abs_diff')} "
+                f"±5={p.get('pct_within_5')}% r={p.get('pearson_r')} n={p['n_overlap']}"
+            )
             for device, p in stats["pairs"].items()
         ]
         subtitle = f"vs {base_name} baseline —   " + "    ".join(segs)

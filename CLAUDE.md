@@ -86,6 +86,8 @@ These APIs are new or recently changed; do not trust training-data memory for th
 
 ### Cross-device comparison rule
 
+**`strap` and `garmin` are ONE sensor, not two devices.** `STRAP_BLE_ADDRESS` is the Garmin HRM chest strap, so the live BLE `strap` series and the `garmin` series imported from Garmin Connect are the same physical sensor arriving by two transports. Their agreement checks the import pipeline's parsing and time-alignment — it is **not** a cross-device accuracy result, and counting both as independent devices double-counts one sensor. `capture/compare.py:SAME_SENSOR_PAIRS` encodes this and `hr-compare` labels the pair as a transport check. The genuinely independent comparisons are Whoop and Fitbit against the Garmin strap.
+
 **Never average `*_score` fields across devices.** Each device's 0–100 score uses a proprietary scale and algorithm — averaging them is meaningless. The intended comparison is **Spearman rank correlation** on per-device score series (planned for Phase 6's analysis script). When in doubt, prefer raw physiological values (HRV, RHR, total sleep minutes) over device scores for any comparison.
 
 ## Daily automation

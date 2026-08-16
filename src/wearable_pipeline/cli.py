@@ -324,8 +324,20 @@ def hr_compare(
         raise typer.Exit(code=2)
 
     if stats.get("pairs"):
+        from .capture.compare import is_same_sensor
+
         typer.echo(f"  baseline: {stats['baseline']}")
         for device, p in stats["pairs"].items():
+            # Same sensor by another transport is a pipeline check, not a
+            # device comparison — say so instead of listing it as agreement.
+            if is_same_sensor(device, stats["baseline"]):
+                typer.echo(
+                    f"  {device} vs {stats['baseline']}: SAME SENSOR "
+                    f"(transport check, not a device comparison) "
+                    f"mean_abs_diff={p.get('mean_abs_diff')} "
+                    f"n_overlap={p['n_overlap']}"
+                )
+                continue
             typer.echo(
                 f"  {device} vs {stats['baseline']}: "
                 f"mean_abs_diff={p.get('mean_abs_diff')} "
