@@ -66,11 +66,19 @@ async def capture_session(
     *,
     client_factory: Callable[[str], Any] | None = None,
     reconnect_attempts: int = 3,
+    retry_backoff_s: float = 10.0,
 ) -> dict[str, int]:
     """Connect each device, forward samples via on_sample until stop_event set.
 
-    Returns a per-device count of samples received. A device that keeps failing
-    to connect is logged and skipped; the others continue (partial tolerance).
+    Returns a per-device count of samples received. A device that fails to
+    connect — or drops mid-session (e.g. a swimmer going out of BLE range
+    underwater) — keeps retrying for the lifetime of the session rather than
+    giving up permanently: the first `reconnect_attempts` retries use a fast
+    1s interval, then back off to `retry_backoff_s` so a device that's
+    genuinely unreachable for a long stretch doesn't hammer the BLE stack or
+    spam logs. Reconnecting mid-session (e.g. a wall touch or resurfacing)
+    picks the stream back up automatically. Other devices continue
+    independently the whole time (partial tolerance).
     """
     if client_factory is None:
         from bleak import BleakClient
@@ -89,7 +97,9 @@ async def capture_session(
         return wrapped
 
     async def run_device(device: str, address: str) -> None:
-        for attempt in range(1, reconnect_attempts + 1):
+        attempt = 0
+        while not stop_event.is_set():
+            attempt += 1
             try:
                 async with client_factory(address) as client:
                     await client.start_notify(
@@ -100,13 +110,18 @@ async def capture_session(
                 return
             except Exception as exc:
                 logger.warning(
-                    "device %s connect/notify failed (attempt %d/%d): %s",
-                    device, attempt, reconnect_attempts, exc,
+                    "device %s connect/notify failed (attempt %d): %s",
+                    device, attempt, exc,
                 )
                 if stop_event.is_set():
                     return
-                await asyncio.sleep(1.0)
-        logger.error("device %s gave up after %d attempts", device, reconnect_attempts)
+                delay = 1.0 if attempt <= reconnect_attempts else retry_backoff_s
+                try:
+                    # Sleep for the backoff, but wake immediately if the
+                    # session ends mid-backoff instead of stalling shutdown.
+                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass  # backoff elapsed without a stop -> retry
 
     await asyncio.gather(*(run_device(d, a) for d, a in addresses.items()))
     return counts

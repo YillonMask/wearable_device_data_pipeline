@@ -148,3 +148,101 @@ def test_device_reconnects_after_transient_failure():
 
     counts = asyncio.run(scenario())
     assert counts["whoop"] == 1  # reconnected on 2nd attempt, got one sample
+
+
+def test_device_reconnects_after_exceeding_reconnect_attempts():
+    """A device that fails more times than `reconnect_attempts` must keep
+    retrying (via the `retry_backoff_s` cadence) instead of permanently
+    giving up on the session — this is the swim scenario: BLE drops out of
+    range for longer than a few quick retries, then comes back later."""
+    start = datetime(2026, 7, 21, 18, 30, 0, tzinfo=timezone.utc)
+    got = []
+    stop = asyncio.Event()
+    state = {"fails": 5}  # more failures than reconnect_attempts=0 below
+
+    class FlakyClient:
+        def __init__(self, address: str):
+            self.address = address
+
+        async def __aenter__(self):
+            if state["fails"] > 0:
+                state["fails"] -= 1
+                raise RuntimeError("still out of range")
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def start_notify(self, uuid, handler):
+            handler(None, bytearray([0x00, 90]))
+            await asyncio.sleep(0)
+
+        async def stop_notify(self, uuid):
+            return None
+
+    async def scenario():
+        async def stopper():
+            await asyncio.sleep(0.5)
+            stop.set()
+
+        counts, _ = await asyncio.gather(
+            capture_session(
+                {"whoop": "A"},
+                start,
+                got.append,
+                stop,
+                client_factory=lambda addr: FlakyClient(addr),
+                reconnect_attempts=0,  # skip straight to the backoff cadence
+                retry_backoff_s=0.05,
+            ),
+            stopper(),
+        )
+        return counts
+
+    counts = asyncio.run(scenario())
+    # 5 failures at ~0.05s backoff (~0.25s) then success, well before the 0.5s stop
+    assert counts["whoop"] == 1
+
+
+def test_backoff_sleep_is_interrupted_by_stop_event():
+    """Stopping a session must not stall waiting for a dead device's backoff
+    to elapse — otherwise ending a normal (non-swim) workout could hang for
+    the full `retry_backoff_s` if some other device happened to be mid-retry."""
+    start = datetime(2026, 7, 21, 18, 30, 0, tzinfo=timezone.utc)
+    got = []
+    stop = asyncio.Event()
+
+    class AlwaysFailClient:
+        def __init__(self, address: str):
+            self.address = address
+
+        async def __aenter__(self):
+            raise RuntimeError("never available")
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def scenario():
+        async def stopper():
+            await asyncio.sleep(0.05)
+            stop.set()
+
+        loop = asyncio.get_event_loop()
+        t0 = loop.time()
+        counts, _ = await asyncio.gather(
+            capture_session(
+                {"whoop": "A"},
+                start,
+                got.append,
+                stop,
+                client_factory=lambda addr: AlwaysFailClient(addr),
+                reconnect_attempts=0,
+                retry_backoff_s=5.0,  # would hang the test if not interruptible
+            ),
+            stopper(),
+        )
+        return counts, loop.time() - t0
+
+    counts, elapsed = asyncio.run(scenario())
+    assert counts["whoop"] == 0
+    assert elapsed < 1.0  # returned promptly, not after the full 5s backoff
