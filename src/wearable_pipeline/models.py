@@ -28,6 +28,9 @@ class DailyMetrics(BaseModel):
     light_minutes: int | None = None
     awake_minutes: int | None = None
     sleep_score: int | None = Field(default=None, ge=0, le=100)
+    sleep_consistency: float | None = None  # 0..1
+    sleep_disturbances: int | None = None
+    sleep_debt_minutes: int | None = None
 
     readiness_score: int | None = Field(default=None, ge=0, le=100)
     hrv_ms: float | None = None
@@ -35,6 +38,7 @@ class DailyMetrics(BaseModel):
     respiratory_rate: float | None = None
     body_temp_deviation: float | None = None  # Oura
     skin_temp: float | None = None  # Whoop
+    spo2_pct: float | None = None  # 0..100
 
     strain_or_activity_score: float | None = None
     active_calories: int | None = None

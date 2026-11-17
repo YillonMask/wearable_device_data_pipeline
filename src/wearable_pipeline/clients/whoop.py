@@ -8,10 +8,11 @@ record contributes to ``day = D`` iff its ``end`` timestamp, converted to
 ``LOCAL_TIMEZONE``, falls on ``D``. The recovery for that sleep and the
 cycle whose id matches drive the rest of ``DailyMetrics``.
 
-API base: ``https://api.prod.whoop.com/developer/v1/``. Authentication is via
-the shared ``TokenManager`` (OAuth 2.0 authorization-code flow). The Whoop API
-does not expose step count or active calories directly; we convert ``kilojoule``
-from the cycle score to kcal for ``active_calories``.
+API base: ``https://api.prod.whoop.com/developer/v2/``. Authentication is via
+the shared ``TokenManager`` (OAuth 2.0 authorization-code flow). Steps come
+from the cycle's top-level ``step_count``. Whoop does not expose active
+calories directly; we convert ``kilojoule`` from the cycle score to kcal for
+``active_calories``.
 """
 
 from __future__ import annotations
@@ -228,9 +229,17 @@ class WhoopClient:
             resting_hr=rec_score.get("resting_heart_rate"),
             respiratory_rate=sleep_score.get("respiratory_rate"),
             skin_temp=rec_score.get("skin_temp_celsius"),
+            spo2_pct=rec_score.get("spo2_percentage"),
+            sleep_consistency=_pct_to_unit(
+                sleep_score.get("sleep_consistency_percentage")
+            ),
+            sleep_disturbances=stages.get("disturbance_count"),
+            sleep_debt_minutes=_milli_to_min(
+                (sleep_score.get("sleep_needed") or {}).get("need_from_sleep_debt_milli")
+            ),
             strain_or_activity_score=cyc_score.get("strain"),
             active_calories=_kj_to_kcal(cyc_score.get("kilojoule")),
-            steps=None,  # not exposed in the Whoop public API
+            steps=_round_int((cycle or {}).get("step_count")),
         )
 
 

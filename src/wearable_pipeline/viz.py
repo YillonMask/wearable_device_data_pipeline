@@ -42,6 +42,10 @@ _METRIC_OPTIONS: tuple[str, ...] = (
     "active_calories",
     "body_temp_deviation",
     "skin_temp",
+    "spo2_pct",
+    "sleep_consistency",
+    "sleep_disturbances",
+    "sleep_debt_minutes",
 )
 
 _DEVICE_ORDER = ("self", "oura", "whoop", "google_health")

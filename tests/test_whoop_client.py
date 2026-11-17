@@ -102,6 +102,7 @@ def test_fetch_day_normalizes_full_record(env_file: Path) -> None:
                         "average_heart_rate": 70,
                         "max_heart_rate": 145,
                     },
+                    "step_count": 8421,
                 }
             ],
             "next_token": None,
@@ -119,6 +120,7 @@ def test_fetch_day_normalizes_full_record(env_file: Path) -> None:
                         "resting_heart_rate": 50,
                         "hrv_rmssd_milli": 45.5,
                         "skin_temp_celsius": 35.5,
+                        "spo2_percentage": 95.8,
                     },
                 }
             ],
@@ -142,10 +144,16 @@ def test_fetch_day_normalizes_full_record(env_file: Path) -> None:
                             "total_light_sleep_time_milli": 14400000,
                             "total_slow_wave_sleep_time_milli": 7200000,
                             "total_rem_sleep_time_milli": 7200000,
+                            "disturbance_count": 12,
                         },
                         "respiratory_rate": 14.5,
                         "sleep_performance_percentage": 91.0,
                         "sleep_efficiency_percentage": 89.0,
+                        "sleep_consistency_percentage": 78.0,
+                        "sleep_needed": {
+                            "baseline_milli": 27000000,
+                            "need_from_sleep_debt_milli": 2700000,
+                        },
                     },
                 }
             ],
@@ -170,10 +178,14 @@ def test_fetch_day_normalizes_full_record(env_file: Path) -> None:
     assert m.resting_hr == 50
     assert m.respiratory_rate == 14.5
     assert m.skin_temp == 35.5
+    assert m.spo2_pct == 95.8
+    assert m.sleep_consistency == pytest.approx(0.78)
+    assert m.sleep_disturbances == 12
+    assert m.sleep_debt_minutes == 45
     assert m.strain_or_activity_score == 14.5
     # 7000 kJ / 4.184 ≈ 1673 kcal
     assert m.active_calories == 1673
-    assert m.steps is None
+    assert m.steps == 8421
     assert len(result.raw) == 3
 
 
