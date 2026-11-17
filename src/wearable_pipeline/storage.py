@@ -50,21 +50,31 @@ def upsert_daily_metrics(conn: sqlite3.Connection, metrics: DailyMetrics) -> Non
 
 
 def upsert_self_report(
-    conn: sqlite3.Connection, *, day: date, readiness: int
-) -> None:
-    conn.execute(
+    conn: sqlite3.Connection,
+    *,
+    day: date,
+    readiness: int,
+    logged_at: datetime | None = None,
+) -> bool:
+    """Write a day's subjective score; ``logged_at`` defaults to now.
+
+    A date logged in two places (``wearable log`` and the phone inbox) keeps
+    whichever entry was logged later, so syncing an older phone entry never
+    clobbers a newer correction, and re-syncing the same entry is a no-op.
+    Returns whether the row was written.
+    """
+    stamp = (logged_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cur = conn.execute(
         "INSERT INTO self_report (date, readiness, logged_at) "
         "VALUES (?, ?, ?) "
         "ON CONFLICT(date) DO UPDATE SET "
         "  readiness = excluded.readiness, "
-        "  logged_at = excluded.logged_at",
-        (
-            day.isoformat(),
-            readiness,
-            datetime.now(timezone.utc).isoformat(),
-        ),
+        "  logged_at = excluded.logged_at "
+        "WHERE excluded.logged_at > self_report.logged_at",
+        (day.isoformat(), readiness, stamp.isoformat()),
     )
     conn.commit()
+    return cur.rowcount > 0
 
 
 def upsert_workout(conn: sqlite3.Connection, workout: Workout) -> None:

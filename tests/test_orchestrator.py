@@ -179,6 +179,8 @@ def _settings_stub(tmp_path: Path) -> Settings:
         whoop_ble_address=None,
         fitbit_ble_address=None,
         strap_ble_address=None,
+        self_report_url=None,
+        self_report_token=None,
     )
 
 

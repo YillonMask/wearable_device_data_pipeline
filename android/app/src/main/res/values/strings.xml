@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Morning Log</string>
+    <string name="alarm_time">Alarm: %1$s</string>
+    <string name="alarm_enabled">Alarm on</string>
+    <string name="next_alarm">Next alarm: %1$s %2$s</string>
+    <string name="alarm_off">Alarm is off</string>
+    <string name="log_now">Log now</string>
+    <string name="unsent">Unsent scores: %1$d</string>
+    <string name="send_now">Send now</string>
+    <string name="configured">Configured — scores send automatically</string>
+    <string name="not_configured">Not configured — scores are saved on the phone and will send once a URL is built in</string>
+    <string name="notifications_off">Notifications are off — the alarm cannot ring</string>
+    <string name="grant_full_screen">Allow full-screen alarm (needed to ring over the lock screen)</string>
+    <string name="grant_exact">Allow exact alarms (needed to ring on time)</string>
+    <string name="question">How do you feel?</string>
+    <string name="save">Save</string>
+    <string name="snooze">Snooze 9 min</string>
+    <string name="saving">Saving…</string>
+    <string name="saved_sent">Saved ✓ (sent)</string>
+    <string name="saved_retry">Saved on phone — will retry</string>
+    <string name="notif_title">Morning Log</string>
+    <string name="notif_text">How do you feel? Tap to rate.</string>
+</resources>

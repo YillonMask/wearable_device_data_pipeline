@@ -6,13 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 When the user opens a session in this directory and says **"pull data"**, **"morning pull"**, **"fetch yesterday"**, or any obvious variation, do all of the following in one shot:
 
-0. **First, remind the user to run `uv run wearable log` if they haven't already today.** The subjective 1–100 readiness must be entered *before* any device data is shown, otherwise the rating is anchored on what the wearables already concluded. If the user mentions they've already logged, skip this. If they want to log inline, also offer to enter today's Fitbit readiness from the phone app via `uv run wearable log <score> --fitbit-readiness <0-100>` (Google Health's v4 API doesn't return it).
-1. Run `uv run wearable pull --date today` **and then** `uv run wearable pull --date yesterday`. Both are required:
+0. **First, remind the user to log today's feeling if they haven't already**, either on the phone (the Morning Log alarm app, see "Morning Log phone app") or with `uv run wearable log`. The subjective 1–100 readiness must be entered *before* any device data is shown, otherwise the rating is anchored on what the wearables already concluded. If the user mentions they've already logged, skip this. `wearable pull` syncs phone scores automatically (`self_report` line: OK / SKIP / FAIL; it never prints the scores themselves).
+1. Run `uv run wearable pull --date today --device whoop` **and then** `uv run wearable pull --date yesterday --device whoop`. **Whoop only (owner's decision, 2026-11-09): the personal-recovery experiment uses Whoop plus the owner's feelings, not Fitbit or Oura.** Don't pull, report, or chase failures for `google_health`/`oura`, and don't nag about the Google re-auth, unless the owner brings them back. Both pulls are required:
    - **`--date today`** pulls *last night's* sleep. Every device labels a sleep with the **wake-up date**, so a sleep slept on day D−1 evening → day D morning is stored under `date=D` (today). Without this pull, the morning user can't see how they slept.
    - **`--date yesterday`** finalizes yesterday's activity row (steps, active calories), which only fully populates after midnight local once devices upload the prior day's totals.
-2. Report per-device status (OK / FAIL / SKIP) for **both** days, and the key metrics from each successful row. Highlight today's `total_sleep_minutes`, `sleep_score`, `readiness_score`, and `hrv_ms` across devices side-by-side — that's the morning question the user is asking.
+2. Report Whoop's status (OK / FAIL) for **both** days and the key metrics from each successful row: today's `total_sleep_minutes`, `sleep_score`, `readiness_score`, and `hrv_ms`. The feeling score has already been logged by then, so it's fine to show it beside Whoop's recovery.
 3. If any device fails, peek at `raw_payloads` for that device-date to see whether it's a transient API issue or a response-shape change we need to chase — `sqlite3 data/wearable.db "SELECT endpoint, substr(payload, 1, 400) FROM raw_payloads WHERE device='X' AND date='YYYY-MM-DD' ORDER BY id DESC"`.
-4. If all three devices succeed and the user wants more, suggest `uv run wearable analyze` (needs `--extra analysis` installed) to see how cross-device rank correlations are shaping up.
+4. If the user wants more, suggest `uv run wearable recovery scores` or, once there are ≥28 feeling days, `uv run wearable recovery tune`.
 
 Don't ask for permission to do step 1. The user has set up daily morning runs as a known recurring task; the explicit phrase is the consent.
 
@@ -34,10 +34,13 @@ uv run pytest tests/test_orchestrator.py -k retry  # one test by name match
 uv run wearable init                             # create the SQLite db and apply pending migrations
 uv run wearable log                              # interactive: prompt for 1–100 readiness + optional Fitbit readiness
 uv run wearable log 70 --fitbit-readiness 48     # one-shot: log subjective=70 and manual Fitbit readiness=48
+uv run wearable log-inbox                        # write the phone-inbox Apps Script (token filled in) + deploy steps
+uv run wearable log-sync                         # pull Morning Log phone scores into self_report (pull does this too)
 uv run wearable auth whoop                       # interactive OAuth → writes WHOOP_REFRESH_TOKEN to .env
 uv run wearable auth google                      # interactive OAuth → writes GOOGLE_HEALTH_REFRESH_TOKEN to .env
 uv run wearable pull --date yesterday            # pull all devices that have credentials
 uv run wearable pull --date 2026-06-12           # pull a specific day
+uv run wearable pull --date today --device whoop # only some devices (repeatable --device); others not pulled or counted
 uv run wearable backfill --since 2026-05-23      # walk every day from --since to yesterday
 uv run wearable backfill --since 2026-05-23 --skip-existing  # idempotent re-run, skip complete days
 uv run wearable analyze --since 2026-05-23       # Spearman rank correlation across device pairs
@@ -46,11 +49,15 @@ uv sync --extra garmin                           # install the Garmin Connect cl
 uv run wearable auth garmin                      # one-time SSO login (prompts MFA), caches tokens ~1yr
 uv run wearable hr-import-garmin --session <id>  # merge Garmin activity HR into a BLE session
 uv run wearable hr-import-fitbit --session <id>  # merge Fitbit intraday (~2s) HR into a BLE session
-uv run wearable hr-swim --date 2026-08-07        # SWIMS: one-shot API-only session (Garmin+Whoop+Fitbit)
+uv run wearable hr-swim --date 2026-08-07        # SWIMS: one-shot API-only session (Garmin+Whoop; Fitbit no longer worn)
 
 uv sync --extra viz                              # install Streamlit + pandas/scipy for the UI
 uv run wearable viz                              # launch the Streamlit dashboard at http://localhost:8501
 uv run wearable viz --port 8765                  # ...or pick a different port
+
+uv run wearable recovery explain                 # fit a Whoop recovery replica, show weights + HRV/sleep share
+uv run wearable recovery scores --scale sleep=2  # daily table: whoop / replica / re-weighted / personal / feeling
+uv run wearable recovery tune                    # tune to `wearable log` feelings (needs ≥28 days), walk-forward test
 ```
 
 `wearable pull` exit codes: 0 = all configured devices succeeded; 2 = partial failure; 1 = no configured devices or all failed. Logs go to stderr (INFO+) and to `data/logs/wearable.log` (DEBUG+, rotating).
@@ -93,85 +100,26 @@ These APIs are new or recently changed; do not trust training-data memory for th
 
 ## Daily automation
 
-Run this every morning to pull yesterday's data across all three devices:
+**Installed and verified 2026-11-09** as a launchd agent on this Mac. It runs `scripts/morning-pull.sh` daily at **9:30 AM local**, 30 min after the owner's 9:00 Morning Log alarm, so the day's feeling score is already on the phone. The script `cd`s to the repo root (`.env` and `data/wearable.db` resolve relative to cwd) and runs both pulls with `--device whoop`: `--date today` for last night's sleep and `--date yesterday` for yesterday's finalized activity (see "Daily morning convention"). Fitbit and Oura are excluded for the personal-recovery experiment, so a healthy run exits 0. Each pull also syncs phone scores into `self_report`.
+
+- **Plist:** `~/Library/LaunchAgents/com.stingrayyee.wearable-daily-pull.plist`. `WorkingDirectory` is this repo. `ProgramArguments` is `/bin/sh scripts/morning-pull.sh` (absolute path). stdout and stderr go to `data/logs/launchd.log`. `RunAtLoad` is false.
+- **`uv` is at `~/.local/bin/uv`** on this Mac, not `/opt/homebrew/bin/uv`. The script defaults to that path (override with `UV=`); launchd's minimal `PATH` can't find it otherwise.
+- **Why launchd, not cron:** `StartCalendarInterval` fires at the **next wake** if the laptop was asleep at 9:30, whereas cron silently skips the run.
 
 ```bash
-cd /Users/xinruiyi/Documents/wearable_devices_datapipeline && uv run wearable pull --date yesterday
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.stingrayyee.wearable-daily-pull.plist  # load
+launchctl print gui/$(id -u)/com.stingrayyee.wearable-daily-pull | grep -E 'state|last exit'      # status
+launchctl kickstart gui/$(id -u)/com.stingrayyee.wearable-daily-pull                               # run now
+launchctl bootout gui/$(id -u)/com.stingrayyee.wearable-daily-pull                                 # unload
 ```
 
-It must be run from the project directory — `.env` (credentials) and `data/wearable.db` (the database) are loaded relative to cwd. Run it between **7–10 AM PT**: Oura/Whoop/Google Health all finalize yesterday's data after midnight, and devices typically finish syncing by 6 AM.
-
-### Option A — launchd (recommended on macOS laptops)
-
-cron silently skips scheduled times when the laptop is asleep; launchd's `StartCalendarInterval` runs the job at the **next wake** after the scheduled time, so a closed lid never costs you a day.
-
-The plist invokes a small shell wrapper (`scripts/morning-pull.sh`) that runs **two pulls**: `--date today` for last night's sleep and `--date yesterday` for yesterday's finalized activity. See "Daily morning convention" above for why both are needed.
-
-1. Save this to `~/Library/LaunchAgents/com.xinruiyi.wearable-daily-pull.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.xinruiyi.wearable-daily-pull</string>
-    <key>WorkingDirectory</key>
-    <string>/Users/xinruiyi/Documents/wearable_devices_datapipeline</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>/opt/homebrew/bin/uv run wearable pull --date today; /opt/homebrew/bin/uv run wearable pull --date yesterday</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key><integer>8</integer>
-        <key>Minute</key><integer>30</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>/Users/xinruiyi/Documents/wearable_devices_datapipeline/data/logs/launchd.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/xinruiyi/Documents/wearable_devices_datapipeline/data/logs/launchd.log</string>
-    <key>RunAtLoad</key><false/>
-</dict>
-</plist>
-```
-
-2. Load it:
-```bash
-launchctl load ~/Library/LaunchAgents/com.xinruiyi.wearable-daily-pull.plist
-```
-
-3. Verify it's scheduled:
-```bash
-launchctl list | grep wearable
-```
-
-4. To run it once manually (useful for testing):
-```bash
-launchctl start com.xinruiyi.wearable-daily-pull
-```
-
-5. To stop / unload:
-```bash
-launchctl unload ~/Library/LaunchAgents/com.xinruiyi.wearable-daily-pull.plist
-```
-
-### Option B — cron
-
-For a desktop that's always on, cron is simpler:
-```cron
-30 8 * * * cd /Users/xinruiyi/Documents/wearable_devices_datapipeline && /opt/homebrew/bin/uv run wearable pull --date today >> data/logs/cron.log 2>&1; cd /Users/xinruiyi/Documents/wearable_devices_datapipeline && /opt/homebrew/bin/uv run wearable pull --date yesterday >> data/logs/cron.log 2>&1
-```
-
-Add with `crontab -e`. cron's `PATH` is minimal — use the absolute path to `uv` (`which uv` to verify; on Apple Silicon it's typically `/opt/homebrew/bin/uv`).
+`last exit code` is the second pull's exit status: 0 all OK, 2 partial failure (e.g. an expired Google token), 1 nothing succeeded. The project previously lived at `/Users/xinruiyi/Documents/wearable_devices_datapipeline` on another machine; that job does not exist here.
 
 ### Notes & gotchas
 
-- **Working directory matters.** Both launchd's `WorkingDirectory` and the `cd` in cron are required; without them, `dotenv` doesn't find `.env` and the database goes to the wrong place.
-- **Logs**: the `wearable_pipeline` Python logger already writes to `data/logs/wearable.log` (rotating, 10 MB × 5). The launchd/cron `*.log` capture is for stdout/stderr from the process itself — useful for `uv` errors or environment failures.
-- **Token rotation**: Whoop rotates refresh tokens on every call. The CLI uses `TokenManager` which persists the rotation back to `.env`, so daily runs work indefinitely. If a refresh ever fails 400 with `invalid_grant`, re-run `wearable auth whoop`. Same for Google (less commonly — Google's refresh tokens are stable unless the user revokes or the app is in testing mode and idle for 7+ days).
+- **Working directory matters.** `scripts/morning-pull.sh` `cd`s to the repo root itself (and the plist also sets `WorkingDirectory`). Without that, `dotenv` doesn't find `.env` and the database goes to the wrong place.
+- **Logs**: the `wearable_pipeline` Python logger already writes to `data/logs/wearable.log` (rotating, 10 MB × 5). `data/logs/launchd.log` captures the job's own stdout/stderr, which is useful for `uv` errors or environment failures.
+- **Token rotation**: Whoop rotates refresh tokens on every call. The CLI uses `TokenManager` which persists the rotation back to `.env`, so daily runs work indefinitely. If a refresh ever fails 400 with `invalid_grant`, re-run `wearable auth whoop`. Same for Google, but on a **fixed 7-day clock, not an idle timer**: while the OAuth consent screen is in **testing** mode, Google expires every refresh token 7 days after issuance regardless of use — pulling daily does not keep it alive. Verified 2026-08-22: a token that worked Aug 21 returned `invalid_grant` / *"Token has been expired or revoked."* on Aug 23. It takes down `google_health` in the daily pull **and** `hr-import-fitbit`, so a swim/workout import failing at `oauth2.googleapis.com/token` means tomorrow's morning pull is already broken too. Fix: re-run `wearable auth google` (interactive). Publishing the app would lift the 7-day limit but triggers the CASA review this project deliberately avoids — so expect to re-auth weekly.
 - **Network failures self-recover**: the orchestrator retries transient errors (429, 5xx, network timeouts) with exponential backoff. A flaky morning won't lose the day.
 - **Catching up after a multi-day gap**: if you miss days (vacation, machine off), run `wearable backfill --since YYYY-MM-DD --skip-existing` — it walks every missed day and skips ones already complete.
 
@@ -186,6 +134,41 @@ The spec breaks the build into 6 phases. Phase 1 (scaffold) is done. The expecta
 5. ✅ **Orchestration** — `orchestrator.py` runs every configured device serially; per-device `try/except` for partial-failure tolerance; bounded retry on `httpx.TimeoutException`, `httpx.NetworkError`, and HTTP 429/500/502/503/504 with `Retry-After` honored; permanent 4xx propagates. Logs via stdlib `logging` to stderr + rotating file.
 6. ✅ **Spearman analysis** — `wearable analyze` (requires the `analysis` extra: `pandas`, `scipy`). Per-pair Spearman rho + p across `{readiness_score, sleep_score, strain_or_activity_score, hrv_ms, resting_hr, total_sleep_minutes}`. Missing values are dropped per-pair, never imputed. No mean rho across pairs (would be meaningless).
 7. ✅ **Streamlit dashboard** — `wearable viz` launches a single-page Streamlit app (`viz.py`) at `localhost:8501`. Reads `data/wearable.db` directly — no network. Sidebar filters (metric, date range, device subset), multi-device line chart for the selected metric, latest-day snapshot table, embedded Spearman correlation. `pd.DataFrame.applymap` was removed in pandas 3.0 — use `.map` (already done; flag if you see it creep back).
+8. ✅ **Personal recovery model** — `wearable recovery {explain,scores,tune}` (`recovery.py`, needs the `analysis` extra). See "Personal recovery model" below.
+
+## Personal recovery model
+
+The owner's goal: copy Whoop's recovery algorithm, then reshape it around how they actually feel.
+
+- **Features are "SD vs your own normal".** There are 11, all from Whoop's `daily_metrics` row: HRV, RHR, respiratory rate, skin temp, SpO2, sleep performance, sleep duration, sleep debt, sleep consistency, disturbances, and yesterday's strain. Each is z-scored against the trailing 30 days (min 14), **with the day itself left out** (`shift(1)`), so a day never counts toward its own baseline. HRV is log-transformed first. `prev_strain` is the previous *calendar* day's strain: `load_frame` reindexes to a gap-free daily calendar, so a missing row gives NaN rather than an older value. A model is `clip(intercept + Σ weight·z, 0, 100)`; each weight reads as "recovery points per 1 SD".
+- **The replica is a linear approximation, not Whoop's algorithm.** Measured 2026-11-07 on 525 days with all 11 inputs: walk-forward MAE 5.4 pts, R² 0.79, rank corr 0.92 (the original 7 inputs gave 5.6 / 0.77 / 0.91). Influence shares: **HRV 61%**, all five sleep inputs 24%, respiratory rate 6%, SpO2 3%, yesterday's strain 3%, RHR 2%, skin temp 1%. HRV alone explains ~69% of the variance and sleep alone ~15%. With HRV held near normal, worst-quartile vs best-quartile sleep performance moves recovery only ~4 pts. That confirms the owner's suspicion that Whoop leans on HRV over sleep. Caveats:
+  - Some of sleep's effect reaches recovery *through* HRV, so these shares understate sleep's total effect.
+  - Small replica weights are not causal. The sleep inputs overlap (consistency and duration each correlate ~0.65 with sleep performance), so the replica gives consistency a slightly *negative* and disturbances a slightly *positive* weight. That only says how Whoop's score is best mimicked once performance is already in the model. Don't read the signs as "consistency is bad".
+- **`--scale NAME=FACTOR`** multiplies replica weights. `sleep` is a group covering all five sleep inputs (`SLEEP_FEATURES`). It's a what-if knob, not a fit.
+- **`tune` is ridge regression shrunk toward the replica**, with the intercept left free so a different personal scale costs nothing. `lam` reads as "the Whoop replica is worth `lam` days of feelings" (`inf` = keep Whoop's weights). `lam` is chosen by walk-forward validation, and the reported accuracies are **nested** walk-forward: each day is scored with a `lam` picked from earlier days only, so the comparison with Whoop is never scored on data it was fitted on. The comparison is personal model vs replica-weights-on-your-scale vs Whoop's own score linearly calibrated to feelings.
+- **Data needed:** `MIN_FEELING_DAYS = 28` days that have a feeling and complete Whoop features. `self_report` was **empty** as of 2026-11-07: the 6/11–7/17 experiment's scores live in the old machine's (`xinruiyi`, possibly the Mac mini) `data/wearable.db`, which never came across with the git move. To recover them, export with `sqlite3 -header -csv data/wearable.db "SELECT * FROM self_report"` on that machine. Any rows logged before migration 0003 there are already ×10.
+- Feelings must still be logged **before** viewing device data (`wearable log`); `recovery scores` shows device numbers, so run it after logging.
+
+## Morning Log phone app
+
+Daily feeling logging from an Android alarm clock, so the score is entered first thing, before any device data.
+
+```mermaid
+flowchart LR
+  A[Android alarm rings] --> B[Rate 1-100, Save]
+  B -->|POST JSON + token| C[Apps Script web app]
+  C --> D[(Google Sheet 'self_report')]
+  D -->|doGet via wearable pull / log-sync| E[(self_report table)]
+```
+
+- **Why a Sheet inbox:** the laptop is often asleep or off the home Wi-Fi. The phone posts to an always-on Google Apps Script web app (`apps_script/self_report_inbox.gs`). The pipeline reads it back whenever it runs. The phone also keeps a local queue and retries until the script answers `{"ok": true}`.
+- **Contract:** POST `{token, date (phone's local YYYY-MM-DD), readiness 1-100, logged_at ISO-UTC}`. GET `?token=&since=` returns `{ok, rows:[{date, readiness, logged_at}]}`. The sheet keeps one row per date (re-logging overwrites). Its date/time columns are forced to plain text, because Sheets otherwise silently converts `2026-11-08` into a Date.
+- **Apps Script redirect quirk:** `/exec` executes, then answers **302** to `script.googleusercontent.com`, where the JSON lives. httpx needs `follow_redirects=True`. The Android client follows it manually as a GET (`HttpURLConnection` won't follow a cross-host redirect).
+- **Secrets:** `SELF_REPORT_TOKEN` (random; generated into `.env`) and `SELF_REPORT_URL` (the `/exec` URL). Both are read from `.env` at **Android build time** into `BuildConfig`, so changing either means rebuilding the APK. `wearable log-inbox` writes the filled-in script to `data/self_report_inbox.gs` (gitignored); the committed template only has the placeholder.
+- **Sync semantics (`self_report_inbox.sync`):** raw response archived to `raw_payloads` (device `self_report`) before rows are written. The phone's `logged_at` is preserved. `upsert_self_report` is **newer-wins** on `logged_at`, so syncing an old phone entry never clobbers a later `wearable log` correction. Default window: the last 60 days (`log-sync --all` for everything). A sync failure prints `FAIL` but never changes `wearable pull`'s exit code.
+- **Redeploying the script:** use Manage deployments → edit → *New version*; a *new deployment* gets a new URL, which would mean rebuilding the APK.
+- **Android app (`android/`, package `dev.wearable.morninglog`):** Kotlin, zero AndroidX or third-party dependencies, minSdk 26 / target 35. AGP 8.11.1 + Kotlin 2.2.21 + Gradle wrapper 8.14.3, a combination chosen from the official Kotlin compatibility table. Don't bump AGP past what the Kotlin plugin supports. The SDK comes from Homebrew's `android-commandlinetools` (`/opt/homebrew/share/android-commandlinetools`, referenced by gitignored `android/local.properties`). Build with `cd android && ./gradlew assembleDebug` and copy `app/build/outputs/apk/debug/app-debug.apk` to `android/morning-log.apk` (gitignored). Install over USB with `adb install -r` (adb is in the SDK's `platform-tools/`), or transfer the APK to the phone and allow "install unknown apps".
+- **App behavior:** `setAlarmClock()` daily alarm, re-armed after it fires, after reboot and after app update. 9-minute snooze. The ringing screen *is* the log screen: a slider starting at 50, and Save stops the alarm. On Android 14+ the full-screen permission may need granting (the main screen shows a button). Unsent scores retry on app open, on each alarm, after Save, and every ~30 min while any remain.
 
 ## OAuth (Whoop, Google Health)
 
@@ -216,7 +199,7 @@ The spec breaks the build into 6 phases. Phase 1 (scaffold) is done. The expecta
 - **Google Health's `heart-rate` stream is MIXED — other vendors relay into it via Android Health Connect.** Verified live 2026-08-15 on the Aug 7 swim window: of 328 data points, only **39** were `platform: "FITBIT"`; the other **289** were `platform: "HEALTH_CONNECT"`, `recordingMethod: "UNKNOWN"`, `application.packageName: "com.whoop.android"` — Whoop's own 6 s-spaced samples arriving through Health Connect. Without `_is_fitbit_source` the "Fitbit" series would have silently absorbed Whoop's data and looked like it had full swim coverage. This is the concrete failure the "pull each device from its own API" rule prevents; never relax the source filter to "get more data".
 - **The Fitbit Air does not measure HR while swimming — by design, not a bug or a settings problem.** Google documents it explicitly: *"Heart-rate tracking is enabled during your swim workout with your Google Pixel Watch 2, 3, and 4 only"* ([support doc](https://support.google.com/googlehealth/answer/14237015)). Confirmed on our own data 2026-08-15, and **the swim record's avg HR is worse than merely absent — it's inconsistent**: the Aug 10 `SWIMMING` record from `platform: FITBIT` has `averageHeartRateBeatsPerMinute: None`, but the Aug 7 one reports **80 bpm against Garmin's measured 115.8** — off by 36, almost certainly averaged from the handful of pre/post-swim samples. Never trust a Fitbit swim `avg_hr`; a present value is not a measured one. The same device's `WALKING` records that day report 93 and 96 normally. The raw sample stream agrees, and its *shape* is the proof: the surviving swim-window samples are not thinly spread, they sit in **two tight clusters at the very start and end with a ~1700 s hole between** (Aug 7: 16 samples in the first 33 s, 1721 s of nothing, 17 samples in the last 30 s; Aug 10: 11 / 1689 s / 9). Those clusters are **deck time** — after the Garmin activity started but before entering the water, and after climbing out but before stopping it — where the sensor is dry and tracks Garmin to within 0–5 bpm. In-water coverage is exactly zero.
 
-  **Consequence for analysis: any Fitbit-vs-X agreement stat on a swim session is computed on dry-land deck seconds and means nothing about swimming.** Aug 7 reports `fitbit_api vs garmin |Δ|=3.29, r=0.952` — Fitbit's best-looking number in the whole project, from n=76 of 1784 s, all of it out of the pool. Always check `n_overlap` against session length before believing a Fitbit swim comparison. **Don't chase this**: there is nothing to fetch, no toggle to flip, and third-party testing of the Air in open water measured a −10.9 bpm bias vs an ECG chest strap with limits of agreement −21.7/+41.7 ("fair to poor"), so even the sparse in-water values it does emit aren't trustworthy. Use Garmin for swim HR.
+  **The owner stopped wearing the Air for swims on 2026-08-22, so this is now mostly historical** — a swim is `garmin` + `whoop_api` only, and `hr-swim` reporting `fitbit: FAIL` or an empty merge is expected output, not a problem to chase. It still matters when reading the three archived swims (Aug 7 / 10 / 13), where any Fitbit-vs-X agreement stat was computed on dry deck seconds and means nothing about swimming: Aug 7 reports `fitbit_api vs garmin |Δ|=3.29, r=0.952` — Fitbit's best-looking number in the whole project, from n=76 of 1784 s, all of it out of the pool. **Don't chase this**: there is nothing to fetch, no toggle to flip, and third-party testing of the Air in open water measured a −10.9 bpm bias vs an ECG chest strap with limits of agreement −21.7/+41.7 ("fair to poor"), so even the sparse in-water values it does emit aren't trustworthy. Use Garmin for swim HR. The Air is still worn for **land** workouts, where it is genuinely good — see the Whoop-vs-Fitbit land result below.
 - **Source filter**: real responses tag Fitbit data with `dataSource: {platform: "FITBIT"}`. `applicationDataSourceId` and other historical fields are empty. `_is_fitbit_source` keys off `platform == "FITBIT"`.
 - **`dataPoints:reconcile` is the merged-source stream** — explicitly never call it. Use `:list` and filter `dataSource` client-side.
 - **Per-sample intraday HR is the `heart-rate` sample data type** (distinct from `daily-resting-heart-rate`), implemented as `GoogleHealthClient.fetch_heart_rate(start, end)` and exposed as `wearable hr-import-fitbit`. Shape per the v4 discovery doc: `dataPoints[].heartRate.beatsPerMinute` (a **string**, like the other numerics) and `dataPoints[].heartRate.sampleTime.physicalTime` (RFC-3339). Source-filter to Fitbit as always — a Pixel Watch on the same account would otherwise contaminate the series. Lands as device **`fitbit_api`**, beside the live BLE `google_health` series.
@@ -233,7 +216,14 @@ The spec breaks the build into 6 phases. Phase 1 (scaffold) is done. The expecta
 - **Refresh tokens are single-use and rotate on every refresh.** `TokenManager._refresh` persists the rotated token back to `.env`. **NEVER call the token endpoint directly with `httpx.post` for ad-hoc probes** — the rotation will be lost and the next refresh fails 400 (`invalid_grant`), requiring a full re-auth. If you must probe, instantiate a `TokenManager` and call `get_access_token()`.
 - **`redirect_uri` matches `localhost` vs `127.0.0.1` strictly.** Whoop rejects mismatches with `invalid_request`. The `.env.example` ships with `127.0.0.1` to match the walkthrough.
 - **Cycle → calendar day**: anchor on the sleep record whose `end` timestamp, converted to `LOCAL_TIMEZONE`, lands on the target day, and `nap == false`. The matching `recovery.sleep_id` and `cycle.id` pull the other two records. Centralized in `_pick_main_sleep` / `_end_local_date`.
-- **Steps are not exposed** in the Whoop public API; `DailyMetrics.steps` stays `None` for `device='whoop'`.
+- **Steps come from `cycle.step_count`**: a top-level cycle field, *not* under `score`. It wasn't in the API when the client was first written; it was found 2026-11-07, and Whoop serves it retroactively. It's present in archived raw payloads back to 2025-04-08, which let the stored rows be backfilled from `raw_payloads` with no API calls (558 of 584 days, the rest have no main sleep). The cycle runs wake-up to next sleep, so `steps` for date D is the waking day D, the same span as `strain_or_activity_score`. That differs from Google Health's midnight-to-midnight `steps`; keep it in mind when comparing.
+- **Sleep detail + SpO2 (migration 0006):**
+  - `spo2_pct` ← `recovery.score.spo2_percentage`
+  - `sleep_consistency` ← `sleep.score.sleep_consistency_percentage / 100`
+  - `sleep_disturbances` ← `stage_summary.disturbance_count`
+  - `sleep_debt_minutes` ← `sleep.score.sleep_needed.need_from_sleep_debt_milli` (ms → min). That's only the *debt* part of sleep need; `baseline_milli`, `need_from_recent_strain_milli` and `need_from_recent_nap_milli` are left in the raw payload.
+
+  All four were backfilled from `raw_payloads` on 2026-11-07 (557–558 days). Google Health fetches `daily-oxygen-saturation` but doesn't map it yet, so its `spo2_pct` stays NULL.
 - **`active_calories` is synthesized** from `cycle.score.kilojoule` (kJ / 4.184) — Whoop reports total cycle calories (which includes BMR), so the synthesized value is much larger than Google Health's "active above resting" kcal. Document the difference when comparing.
 - **Sleep durations are in milliseconds** (`_milli` suffix on the field name). Convert to minutes via `_milli_to_min` (`/ 60000`).
 - **Total asleep = total_in_bed - total_awake** from `stage_summary` — Whoop doesn't expose a direct "total sleep" field at this level.
@@ -255,13 +245,22 @@ The spec breaks the build into 6 phases. Phase 1 (scaffold) is done. The expecta
 - **Two entry points.** `--date <D>` imports each stored Whoop workout that day into its own session id `<workout_start>-whoop` (the suffix can never collide with a live BLE session started the same second); it needs the `workouts` table populated, so it depends on OAuth via `wearable pull`. `--session <hr_session_id>` needs no OAuth at all — it takes an existing BLE capture's window and merges Whoop's stored series into that same session under device key **`whoop_api`**, sitting alongside (never overwriting) the live `whoop` BLE series. That's the one to reach for when comparing against the chest-strap baseline or filling an underwater BLE dropout.
 - Re-importing either way is idempotent — `hr_samples`' PK is `(session_id, device, ts_utc)` and the bucket timestamps are deterministic, so `INSERT OR IGNORE` no-ops.
 - `hr-compare` derives its `max_hold_s` from each series' observed median gap (`max(8, 2 × widest gap)`) so a 6 s (or coarser) imported series doesn't step off the end of `align_series`' 8 s default hold and render as an all-NaN column. BLE-only sessions are unaffected.
-- **NEVER trust Whoop's swim HR at hard effort — it under-reads, and the error grows with intensity.** Verified 2026-08-18 on both API-only swim sessions (`whoop_api` vs `garmin` baseline). Whoop's wrist optical is excellent on land — against the BLE chest strap across three land captures it runs |Δ|=1.5–2.9 bpm, 84–97% within 5 bpm, r=0.977–0.994 — but in water it collapses to |Δ|=5.7–8.6 bpm, **38–57%** within 5 bpm, r=0.756–0.824. The error is not noise; it is one-directional compression of the top end (mean signed error, whoop_api − garmin, by Garmin bpm band):
+- **NEVER trust Whoop's swim HR at hard effort — it under-reads, and the error grows with intensity.** Verified 2026-08-18 on the first two API-only swim sessions and again 2026-08-22 (`whoop_api` vs `garmin` baseline). In water it runs |Δ|=5.4–8.6 bpm, **38–60%** within 5 bpm, r=0.756–0.925. Below ~165 bpm *on land* the same sensor is excellent (|Δ|=1.5–2.9, 84–97% within 5) — but that is an **intensity** bound, not a land/water one; it compresses on land too, see the next bullet. The error is not noise; it is one-directional compression of the top end (mean signed error, whoop_api − garmin, by Garmin bpm band):
   ```
   garmin bpm     90-100  100-110  110-120  120-135    135+
   Aug 7 swim      +0.23    +0.30    -4.87   -11.88  -24.31
   Aug 10 swim     +0.93    +0.52    -3.82    -9.70     n/a
+  Aug 22 swim     -1.14    -4.89    -2.71    -5.68   -9.43   (135+ is only n=21)
   ```
-  Below ~110 bpm Whoop tracks Garmin; above it the gap widens monotonically. Aug 7's mean bias was −7.02 bpm with Whoop reading low on 77% of paired seconds. **Consequence: a Whoop swim *average* is roughly usable (108.8 vs Garmin's 115.8) but its peak/max HR and any hard-interval value are not** — that 7 bpm average error hides a −24 bpm error exactly where you would care. Use Garmin for all swim HR and treat `whoop_api` as a comparison series only. Unlike the Fitbit swim gap (a total absence, dry deck-time clusters only), this is real continuous in-water data that is simply wrong at intensity — so `n_overlap` looks healthy and will not warn you.
+  Above ~110 bpm the gap widens with effort in all three swims. Below 110 it is near-zero on Aug 7/10; Aug 22 reads mildly low there too, but on thin support (n=64 and 72), so treat the sub-110 cells as noise rather than evidence the floor moved. Aug 7's mean bias was −7.02 bpm with Whoop reading low on 77% of paired seconds. **Consequence: a Whoop swim *average* is roughly usable (108.8 vs Garmin's 115.8) but its peak/max HR and any hard-interval value are not** — that 7 bpm average error hides a −24 bpm error exactly where you would care. Use Garmin for all swim HR and treat `whoop_api` as a comparison series only. Unlike the Fitbit swim gap (a total absence, dry deck-time clusters only), this is real continuous in-water data that is simply wrong at intensity — so `n_overlap` looks healthy and will not warn you. **A milder-looking swim usually means an easier swim, not a better sensor.** Aug 22 scored |Δ|=5.39 / 60% / r=0.925 — the best swim numbers yet — only because 47% of it sat in 120–135 and just 21 s went above 135, where Aug 7 spent 760 s and 51 s. Compare band *exposure* before concluding anything improved.
+- **Whoop's land accuracy is bounded by intensity too — it compresses above ~165 bpm on land, and drops out entirely under hard intervals.** The "excellent on land" figure above came from sessions that never exceeded 165 bpm. Verified 2026-08-20 (`20260821T020726Z-garmin`, 82 min, 42% of time >150, max 177): headline |Δ|=6.03, 71.8% within 5, r=0.873 — far worse than the 1.5–2.9 land norm. Restricting to seconds where the Garmin baseline was flat (≤5 bpm over 30 s) isolates true compression from 6 s-bucket transition lag, and the compression survives:
+  ```
+  garmin band   135-150  150-165  165-200     (stable seconds only)
+  |Δ|              1.49     1.92     6.86
+  within 5          97%      98%      70%
+  ```
+  So ~1/3 of the headline error (6.03 → 4.26) is genuine bucketing lag, but the top-end breakdown is the sensor. The Jul 31 elliptical agrees independently (BLE `whoop` vs `strap`: |Δ|=2.5–3.1 in every band below 165, then −5.53 / 35% within 5 above it). Whoop also **loses the signal for minutes at a time** under hard intervals — one 258 s stretch at −40.4 mean, −59 peak (Garmin 138–172 while Whoop read 111–135). Consequence: a Whoop max/peak HR is unusable at high effort **on land as well as in water**, and a hard-interval session is where Fitbit beats it (see below).
+- **On a hard land workout the Fitbit Air outperforms Whoop — the usual ranking flips.** Same 2026-08-20 session: `fitbit_api` |Δ|=3.49, 84.9% within 5, r=0.955 vs `whoop_api` |Δ|=6.03, 71.8%, r=0.873. Fitbit wins on its ~2 s cadence handling fast transitions (vs Whoop's 6 s floor) and on never dropping out for minutes. But it is **not** uniformly better: on stable seconds in the 150–165 band Whoop is sharper (|Δ|=1.92 vs 6.31), and Fitbit fabricates peaks Whoop never does — an 86 s excursion reading +24.6 mean, peaking at **198 against Garmin's 169** (cadence lock, not physiology). Neither device's max HR is usable here: Fitbit overshot by 21, Whoop undershot. Use Garmin for any peak.
 - **A swim needs no Whoop app logging.** `hr-swim` derives the window from the Garmin activity's own HR samples and the internal metrics endpoint is continuous 24/7, not activity-scoped — verified 2026-08-18 with a completely empty `workouts` table and full 6 s `whoop_api` coverage across all three stored swims. Logging the swim in the Whoop app adds only a `workouts` summary row, never samples.
 
 ## Garmin Connect (per-sample workout HR)
@@ -345,8 +344,11 @@ since it talks to devices directly over Bluetooth rather than a vendor API.
   reach the laptop, and the reconnect logic only recovers surface moments (wall
   touches, flip turns). Do NOT run `hr-capture` for a swim — use `wearable
   hr-swim --date <D>`, which builds the session from the Garmin activity (the
-  only source with full underwater coverage) and merges the Whoop and Fitbit
-  API series into it. BLE capture stays the right tool for **land** workouts,
+  only source with full underwater coverage) and merges the Whoop API series
+  into it. Since 2026-08-22 a swim is **`garmin` + `whoop_api` only** — the
+  Fitbit Air is no longer worn for swims (it records nothing underwater), so
+  `hr-swim`'s Fitbit step failing or returning empty is expected, not a fault
+  to investigate. BLE capture stays the right tool for **land** workouts,
   where it gives 1–2 Hz against the API's 1–6 s.
 - **Fitbit only streams while its "Share Heart Rate" toggle is actively live**
   in the Fitbit/Google Health phone app, and it's a low-rate, contact-gated

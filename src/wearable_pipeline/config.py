@@ -37,6 +37,9 @@ class Settings:
     whoop_ble_address: str | None
     fitbit_ble_address: str | None
     strap_ble_address: str | None
+    # Morning Log phone inbox (Google Apps Script web app), see self_report_inbox.py.
+    self_report_url: str | None
+    self_report_token: str | None
 
 
 def _opt(name: str) -> str | None:
@@ -66,4 +69,6 @@ def load_settings() -> Settings:
         whoop_ble_address=_opt("WHOOP_BLE_ADDRESS"),
         fitbit_ble_address=_opt("FITBIT_BLE_ADDRESS"),
         strap_ble_address=_opt("STRAP_BLE_ADDRESS"),
+        self_report_url=_opt("SELF_REPORT_URL"),
+        self_report_token=_opt("SELF_REPORT_TOKEN"),
     )

@@ -67,10 +67,16 @@ Credentials all live in `.env` (git-ignored); `.env.example` is the committed te
 ```bash
 uv run wearable pull --date yesterday          # pull all configured devices for a day
 uv run wearable pull --date 2026-06-12         # a specific day
+uv run wearable pull --date today --device whoop  # only the listed devices (repeatable)
 uv run wearable backfill --since 2026-05-23     # walk every day up to yesterday
 uv run wearable backfill --since 2026-05-23 --skip-existing   # idempotent re-run
 uv run wearable analyze --since 2026-05-23      # Spearman rank correlation across device pairs
 uv run wearable viz                             # launch the Streamlit dashboard
+uv run wearable recovery explain                # Whoop recovery replica: what drives it (HRV vs sleep share)
+uv run wearable recovery scores --scale sleep=2 # Whoop vs replica vs your re-weighted / feeling-tuned recovery
+uv run wearable recovery tune                   # tune recovery to your `wearable log` feelings (≥28 days)
+uv run wearable log-inbox                       # set up the Morning Log phone app's Google Sheet inbox
+uv run wearable log-sync                        # pull phone-logged feelings into self_report (pull does this too)
 ```
 
 `pull` exit codes: `0` all configured devices succeeded · `2` partial failure · `1` no

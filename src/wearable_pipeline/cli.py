@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime, timedelta, timezone
+from typing import get_args
 
+import httpx
 import typer
 
 from . import db
@@ -18,6 +20,7 @@ from .clients.google_health import GoogleHealthClient
 from .clients.whoop_internal import VALID_STEPS, WhoopInternalClient
 from .config import load_settings
 from .logging_setup import configure_logging
+from .models import Device
 from .orchestrator import (
     backfill as orchestrate_backfill,
     enabled_clients,
@@ -25,6 +28,12 @@ from .orchestrator import (
     pull_one_day,
     pull_workouts,
     summarize,
+)
+from .self_report_inbox import (
+    InboxError,
+    default_since as default_inbox_since,
+    render_script as render_inbox_script,
+    sync as sync_inbox,
 )
 from .storage import (
     add_hr_session_device,
@@ -541,12 +550,27 @@ def pull(
     workout_days: int = typer.Option(
         3, "--workout-days", help="How many days back to pull workouts (default 3)."
     ),
+    device: list[str] = typer.Option(
+        [],
+        "--device",
+        help="Only pull these devices (repeatable): oura, whoop, google_health. "
+        "Default: every device.",
+    ),
 ) -> None:
     """Pull one day across all configured devices (Oura, Whoop, Google Health).
 
-    Exits 0 if all configured devices succeeded, 2 on partial failure, 1 if
-    all configured devices failed (or none have credentials).
+    Exits 0 if all pulled devices succeeded, 2 on partial failure, 1 if all
+    failed (or none have credentials). With --device, devices left out are
+    neither pulled nor counted.
     """
+    known = set(get_args(Device))
+    unknown = sorted(set(device) - known)
+    if unknown:
+        typer.echo(
+            f"Unknown --device {', '.join(unknown)}; choose from {', '.join(sorted(known))}",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     day = _parse_date(target_date)
     configure_logging()
     settings = load_settings()
@@ -560,7 +584,7 @@ def pull(
     # stale token; rebuilding clients for the workouts pass would refresh an
     # already-consumed token and fail with invalid_grant. Reusing the same
     # client instances keeps the rotated token in memory consistent.
-    entries = enabled_clients(settings)
+    entries = [e for e in enabled_clients(settings) if not device or e.device in device]
 
     results = pull_one_day(conn, settings, day, clients=entries)
 
@@ -580,6 +604,7 @@ def pull(
 
     s, f, k = summarize(results)
     typer.echo(f"date={day.isoformat()} success={s} failed={f} skipped={k}")
+    _sync_inbox(conn, settings, since=default_inbox_since(date.today()))
 
     if workouts:
         until = day
@@ -686,6 +711,74 @@ def log_cmd(
     typer.echo(f"Logged: {', '.join(parts)} for {day.isoformat()}")
 
 
+@app.command("log-inbox")
+def log_inbox() -> None:
+    """Write the phone-inbox Google Apps Script, token filled in, and print deploy steps."""
+    settings = load_settings()
+    if not settings.self_report_token:
+        typer.echo("SELF_REPORT_TOKEN is not set in .env (any long random string).", err=True)
+        raise typer.Exit(code=2)
+    out = settings.database_path.parent / "self_report_inbox.gs"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_inbox_script(settings.self_report_token))
+    typer.echo(f"Wrote {out} (contains your token; it's gitignored, don't share it).")
+    typer.echo(
+        "\n".join(
+            [
+                "",
+                "One-time setup (~5 min):",
+                "  1. sheets.new -> name it 'Morning Log'.",
+                "  2. Extensions -> Apps Script. Replace Code.gs with the file above. Save.",
+                "  3. Deploy -> New deployment -> type 'Web app'.",
+                "     Execute as: Me.  Who has access: Anyone.  Deploy, then authorize.",
+                "  4. Copy the Web app URL (ends in /exec) into .env as SELF_REPORT_URL=...",
+                "  5. Check it: uv run wearable log-sync",
+                "Editing the script later? Deploy -> Manage deployments -> edit -> New version,",
+                "so the URL stays the same.",
+            ]
+        )
+    )
+
+
+@app.command("log-sync")
+def log_sync(
+    all_rows: bool = typer.Option(
+        False, "--all", help="Fetch every row, not just the last 60 days."
+    ),
+) -> None:
+    """Pull feeling scores logged on the phone (Morning Log) into self_report.
+
+    `wearable pull` does this automatically; this is the standalone version.
+    """
+    configure_logging()
+    settings = load_settings()
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+    since = None if all_rows else default_inbox_since(date.today())
+    if not _sync_inbox(conn, settings, since=since):
+        raise typer.Exit(code=1)
+
+
+def _sync_inbox(conn, settings, *, since: date | None) -> bool:
+    """Sync the phone inbox, reporting like a device line. Never prints scores
+    (anchoring), and a failure here never fails the device pull."""
+    if not (settings.self_report_url and settings.self_report_token):
+        typer.echo(f"  {'self_report':<14s} SKIP SELF_REPORT_URL/SELF_REPORT_TOKEN not set")
+        return False
+    try:
+        result = sync_inbox(
+            conn, url=settings.self_report_url, token=settings.self_report_token, since=since
+        )
+    except (httpx.HTTPError, InboxError) as exc:
+        typer.echo(f"  {'self_report':<14s} FAIL {exc}", err=True)
+        return False
+    typer.echo(
+        f"  {'self_report':<14s} OK   {result.received} on phone, "
+        f"{result.written} written, {result.skipped} skipped"
+    )
+    return True
+
+
 @app.command()
 def viz(
     port: int = typer.Option(8501, "--port", help="Streamlit server port."),
@@ -758,6 +851,192 @@ def analyze(
     if json_path:
         write_json(rows, json_path)
         typer.echo(f"wrote {json_path}")
+
+
+recovery_app = typer.Typer(
+    help="Personal recovery model: Whoop replica, custom weights, feeling-tuned "
+    "(requires the `analysis` extra)."
+)
+app.add_typer(recovery_app, name="recovery")
+
+
+def _recovery_frame():
+    """Import the model lazily (pandas/numpy) and load the full feature frame.
+
+    Always the full history: baselines need warm-up days, and the replica is
+    the prior for tuning regardless of the window being examined.
+    """
+    try:
+        from . import recovery
+    except ImportError:
+        typer.echo(
+            "pandas/numpy missing. Install with: `uv sync --extra analysis`", err=True
+        )
+        raise typer.Exit(code=2)
+    settings = load_settings()
+    conn = db.connect(settings.database_path)
+    db.migrate(conn)
+    return recovery, recovery.load_frame(conn)
+
+
+def _date_slice(frame, since: str | None, until: str | None):
+    lo = _parse_date(since).isoformat() if since else None
+    hi = _parse_date(until).isoformat() if until else None
+    return frame.loc[lo:hi]
+
+
+def _fit_replica_or_exit(recovery, frame):
+    try:
+        return recovery.fit_replica(frame)
+    except ValueError as exc:
+        typer.echo(f"Cannot fit the Whoop replica: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+
+def _weights_table(recovery, columns: dict, frame) -> str:
+    """Rows per feature: weight (pts per SD) and share, one pair per model."""
+    shares = {name: recovery.contribution_shares(m, frame) for name, m in columns.items()}
+    header = f"{'feature':<22}" + "".join(f"{name:>21} " for name in columns)
+    lines = [header, f"{'':<22}" + "".join(f"{'pts/SD   share':>21} " for _ in columns)]
+    for f in recovery.FEATURES:
+        cells = "".join(
+            f"{m.weights[f]:>+13.2f} {shares[name][f]:>7.0%} " for name, m in columns.items()
+        )
+        lines.append(f"{recovery.FEATURE_LABELS[f]:<22}{cells}")
+    for group in ("hrv", "sleep"):
+        cells = "".join(
+            f"{'':>13} {recovery.group_share(shares[name], group):>7.0%} " for name in columns
+        )
+        lines.append(f"{'= ' + group + ' total':<22}{cells}")
+    return "\n".join(lines)
+
+
+@recovery_app.command("explain")
+def recovery_explain(
+    since: str | None = typer.Option(None, "--since", help="ISO date lower bound."),
+    until: str | None = typer.Option(None, "--until", help="ISO date upper bound."),
+) -> None:
+    """Fit a linear replica of Whoop's recovery and show what drives it.
+
+    Weights are recovery points per 1 SD above your own trailing 30-day normal;
+    share is each feature's portion of the total day-to-day influence.
+    """
+    recovery, frame = _recovery_frame()
+    frame = _date_slice(frame, since, until)
+    model = _fit_replica_or_exit(recovery, frame)
+    rows = recovery.complete_rows(frame, "whoop")
+    typer.echo(
+        f"Whoop recovery replica: {len(rows)} days "
+        f"({rows.index.min():%Y-%m-%d} to {rows.index.max():%Y-%m-%d}), "
+        f"intercept {model.intercept:.1f}"
+    )
+    try:
+        acc = recovery.backtest_replica(frame)
+        typer.echo(
+            f"Walk-forward accuracy on {acc.n} days (each predicted from earlier "
+            f"days only): MAE {acc.mae:.1f} pts, R2 {acc.r2:.2f}, "
+            f"rank corr {acc.rank_corr:.2f}"
+        )
+    except ValueError as exc:
+        typer.echo(f"(walk-forward accuracy skipped: {exc})")
+    typer.echo("")
+    typer.echo(_weights_table(recovery, {"whoop replica": model}, rows))
+
+
+def _parse_scales(values: list[str]) -> dict[str, float]:
+    scales: dict[str, float] = {}
+    for item in values:
+        name, sep, factor = item.partition("=")
+        try:
+            if not sep:
+                raise ValueError
+            scales[name.strip()] = float(factor)
+        except ValueError:
+            typer.echo(f"--scale expects NAME=FACTOR, got {item!r}", err=True)
+            raise typer.Exit(code=2)
+    return scales
+
+
+@recovery_app.command("scores")
+def recovery_scores(
+    days: int = typer.Option(14, "--days", help="How many recent days to show."),
+    until: str | None = typer.Option(None, "--until", help="Last day shown (default: latest)."),
+    scale: list[str] = typer.Option(
+        [],
+        "--scale",
+        help="Re-weight the replica, e.g. --scale sleep=2 --scale hrv=0.7. "
+        "Names: hrv, rhr, resp, skin_temp, spo2, sleep_perf, sleep_dur, sleep_debt, "
+        "sleep_consistency, disturbances, prev_strain, or sleep (all five sleep inputs).",
+    ),
+) -> None:
+    """Daily table: Whoop's recovery, the replica, your re-weighted version,
+    and the feeling-tuned model once enough feelings are logged."""
+    recovery, frame = _recovery_frame()
+    frame = _date_slice(frame, None, until)
+    replica = _fit_replica_or_exit(recovery, frame)
+    columns = {"whoop": frame["whoop"], "replica": replica.predict(frame)}
+    scales = _parse_scales(scale)
+    if scales:
+        try:
+            columns["custom"] = replica.scaled(scales).predict(frame)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=2)
+    try:
+        columns["personal"] = recovery.tune_to_feelings(frame, replica).model.predict(frame)
+    except ValueError as exc:
+        typer.echo(f"(no personal column: {exc})")
+    columns["feeling"] = frame["feeling"]
+
+    shown = frame.index[-days:]
+    typer.echo(f"{'date':<12}" + "".join(f"{name:>10}" for name in columns))
+    for day in shown:
+        cells = "".join(
+            f"{'-':>10}" if col[day] != col[day] else f"{col[day]:>10.0f}"  # NaN != NaN
+            for col in columns.values()
+        )
+        typer.echo(f"{day:%Y-%m-%d}  {cells}")
+
+
+@recovery_app.command("tune")
+def recovery_tune(
+    since: str | None = typer.Option(None, "--since", help="ISO date lower bound."),
+    until: str | None = typer.Option(None, "--until", help="ISO date upper bound."),
+) -> None:
+    """Tune the model to your `wearable log` feelings and test it honestly.
+
+    Starts from the Whoop replica and moves only as far as your feelings
+    justify. All accuracies are walk-forward: each day is predicted from
+    earlier days only.
+    """
+    recovery, full = _recovery_frame()
+    # The replica is fitted on the full history even when --since/--until
+    # narrow the feeling window: Whoop's weights are the prior either way.
+    replica = _fit_replica_or_exit(recovery, full)
+    frame = _date_slice(full, since, until)
+    try:
+        result = recovery.tune_to_feelings(frame, replica)
+    except ValueError as exc:
+        typer.echo(f"Not enough data to tune yet: {exc}.")
+        typer.echo("Keep logging every morning with `uv run wearable log` before looking at any device.")
+        raise typer.Exit(code=1)
+
+    lam = "inf (feelings don't justify moving off Whoop's weights)" if result.lam == float("inf") else f"{result.lam:g} days"
+    typer.echo(f"Tuned on {result.n_days} days of feelings. Whoop prior worth: {lam}")
+    typer.echo("")
+    rows = recovery.complete_rows(frame, "feeling")
+    typer.echo(
+        _weights_table(recovery, {"whoop replica": replica, "personal": result.model}, rows)
+    )
+    typer.echo("")
+    typer.echo(f"Predicting your feeling, walk-forward over {result.personal.n} days:")
+    typer.echo(f"{'':<34}{'MAE':>7}{'R2':>7}{'rank':>7}")
+    for label, acc in (
+        ("personal model", result.personal),
+        ("Whoop weights, your scale", result.whoop_weights),
+        ("Whoop's own score, calibrated", result.whoop_score),
+    ):
+        typer.echo(f"{label:<34}{acc.mae:>7.1f}{acc.r2:>7.2f}{acc.rank_corr:>7.2f}")
 
 
 @app.command()

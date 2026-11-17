@@ -30,3 +30,13 @@ dist/
 # personal-data artifacts (kept out of the public repo)
 viz-screenshot.png
 xiaohongshu_post/
+wearable-film/
+wearable-film-hf/
+
+# Android (android/ Morning Log app)
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/local.properties
+android/morning-log.apk

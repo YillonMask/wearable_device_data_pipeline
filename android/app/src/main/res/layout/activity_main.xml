@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <Button
+            android:id="@+id/time"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="24sp" />
+
+        <Switch
+            android:id="@+id/enabled"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:minHeight="48dp"
+            android:text="@string/alarm_enabled"
+            android:textSize="18sp" />
+
+        <TextView
+            android:id="@+id/next"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp" />
+
+        <Button
+            android:id="@+id/full_screen"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/grant_full_screen"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/exact"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/grant_exact"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/log_now"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/log_now" />
+
+        <TextView
+            android:id="@+id/pending"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/send_now"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/send_now" />
+
+        <TextView
+            android:id="@+id/config"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp" />
+    </LinearLayout>
+</ScrollView>
